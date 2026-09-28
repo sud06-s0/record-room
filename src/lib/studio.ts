@@ -65,6 +65,8 @@ export class Studio {
   /** Fallback (Firefox): hidden <video> elements frames are grabbed from. */
   private readonly pullVideos: Partial<Record<SourceKey, HTMLVideoElement>> = {}
   private grabbing = false
+  /** Current layout, so the camera can be captured at a size that fits it. */
+  private layoutMode: Layout['mode'] = 'bubble'
   private tap: PcmTap | null = null
 
   constructor(
@@ -170,7 +172,9 @@ export class Studio {
     this.cameraOwned = true
     const track = stream.getVideoTracks()[0]
     track.contentHint = 'motion'
-    this.sendTrack('camera', track.clone())
+    const feed = track.clone()
+    this.sendTrack('camera', feed)
+    await this.fitCameraToLayout()
     return track.getSettings()
   }
 
@@ -308,6 +312,28 @@ export class Studio {
   // ---------- settings ----------
   setLayout(layout: Partial<Layout>) {
     this.send({ type: 'layout', layout })
+    if (layout.mode && layout.mode !== this.layoutMode) {
+      this.layoutMode = layout.mode
+      void this.fitCameraToLayout()
+    }
+  }
+
+  /**
+   * The bubble is only ~350–450 px wide, so a 720p webcam feed is already more
+   * than sharp enough there, and it's less than half the pixels to process each
+   * frame. Camera-only and 50/50 get the full 1080p feed.
+   */
+  private async fitCameraToLayout() {
+    const feed = this.sentTracks.camera
+    if (!feed || !this.cameraOwned || feed.readyState !== 'live') return
+    const small = this.layoutMode === 'bubble'
+    try {
+      await feed.applyConstraints({
+        width: { ideal: small ? 1280 : 1920 },
+        height: { ideal: small ? 720 : 1080 },
+        frameRate: { ideal: this.fps },
+      })
+    } catch {}
   }
   setFps(fps: number) {
     this.fps = fps
