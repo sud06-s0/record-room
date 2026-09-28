@@ -2,7 +2,7 @@
 // Main-thread controller: grabs camera / mic / screen, wires them into the
 // compositor worker and the audio mixer, and drives recording.
 
-import { AudioMixer, type NcMode } from './audio'
+import { AudioMixer, type NcMode, type PcmTap } from './audio'
 import type { FromWorker, Layout, SaveTarget, SourceKey, StudioEvent, ToWorker } from '../shared/types'
 
 export type QualityKey = '1080p30' | '1080p60'
@@ -21,11 +21,26 @@ export interface ScreenInfo {
   hasAudio: boolean
 }
 
+const isFirefox = /firefox/i.test(navigator.userAgent)
+const hasTrackProcessor = 'MediaStreamTrackProcessor' in window
+
+/** What this browser can do. Chrome / Edge: everything. Firefox: a reduced set. */
+export const CAPS = {
+  /** Full-speed capture in the worker. Without it frames are pulled from hidden <video>s. */
+  trackProcessor: hasTrackProcessor,
+  /** Record a single browser tab */
+  tabCapture: !isFirefox,
+  /** PC / tab sound from screen sharing */
+  displayAudio: !isFirefox,
+  /** Full feature set available */
+  full: hasTrackProcessor && !isFirefox,
+}
+
 export function browserSupport(): string[] {
   const missing: string[] = []
   if (!('VideoEncoder' in window)) missing.push('WebCodecs (VideoEncoder)')
-  if (!('MediaStreamTrackProcessor' in window)) missing.push('MediaStreamTrackProcessor')
-  if (!('OffscreenCanvas' in window)) missing.push('OffscreenCanvas')
+  if (!('AudioEncoder' in window)) missing.push('WebCodecs (AudioEncoder)')
+  if (!('transferControlToOffscreen' in HTMLCanvasElement.prototype)) missing.push('OffscreenCanvas')
   if (!navigator.mediaDevices?.getDisplayMedia) missing.push('Screen capture')
   if (!('AudioWorkletNode' in window)) missing.push('AudioWorklet')
   return missing
@@ -42,16 +57,57 @@ export class Studio {
   private micStream: MediaStream | null = null
   private screenStream: MediaStream | null = null
   private fps = 30
+  /** Tracks currently feeding the worker, so they can be stopped when replaced. */
+  private readonly sentTracks: Partial<Record<SourceKey, MediaStreamTrack>> = {}
+  /** Fallback (Firefox): hidden <video> elements frames are grabbed from. */
+  private readonly pullVideos: Partial<Record<SourceKey, HTMLVideoElement>> = {}
+  private grabbing = false
+  private tap: PcmTap | null = null
 
   constructor(
     canvasEl: HTMLCanvasElement,
     private readonly onEvent: (ev: StudioEvent) => void,
   ) {
     this.worker = new Worker(new URL('../workers/compositor.worker.ts', import.meta.url), { type: 'module' })
-    this.worker.onmessage = (e: MessageEvent<FromWorker>) => this.onEvent(e.data)
+    this.worker.onmessage = (e: MessageEvent<FromWorker>) => this.handleWorker(e.data)
     this.worker.onerror = (e) => this.onEvent({ type: 'error', message: e.message || 'Worker error' })
     const off = canvasEl.transferControlToOffscreen()
     this.send({ type: 'init', canvas: off }, [off])
+    if (!CAPS.trackProcessor) this.send({ type: 'pull-mode', on: true })
+  }
+
+  private handleWorker(msg: FromWorker) {
+    if (msg.type === 'need-frames') {
+      void this.grabFrames()
+      return
+    }
+    if (msg.type === 'stopped' || msg.type === 'discarded' || msg.type === 'error') {
+      this.tap?.stop()
+      this.tap = null
+    }
+    this.onEvent(msg)
+  }
+
+  /** Fallback: snapshot the hidden videos and hand the images to the worker. */
+  private async grabFrames() {
+    if (this.grabbing) return
+    this.grabbing = true
+    const frames: Partial<Record<SourceKey, ImageBitmap>> = {}
+    const transfer: Transferable[] = []
+    try {
+      for (const key of ['screen', 'camera'] as const) {
+        const v = this.pullVideos[key]
+        if (!v || v.readyState < 2 || !v.videoWidth) continue
+        try {
+          const bmp = await createImageBitmap(v)
+          frames[key] = bmp
+          transfer.push(bmp)
+        } catch {}
+      }
+    } finally {
+      this.grabbing = false
+      this.send({ type: 'frames', frames }, transfer)
+    }
   }
 
   private send(msg: ToWorker, transfer: Transferable[] = []) {
@@ -59,12 +115,35 @@ export class Studio {
   }
 
   private sendTrack(key: SourceKey, track: MediaStreamTrack | null) {
+    this.sentTracks[key]?.stop()
+    this.sentTracks[key] = track ?? undefined
+    const oldVideo = this.pullVideos[key]
+    if (oldVideo) {
+      oldVideo.srcObject = null
+      oldVideo.remove()
+      delete this.pullVideos[key]
+    }
+
     if (!track) {
       this.send({ type: 'source', key, readable: null })
       return
     }
-    const { readable } = new MediaStreamTrackProcessor<VideoFrame>({ track })
-    this.send({ type: 'source', key, readable }, [readable])
+    if (CAPS.trackProcessor) {
+      const { readable } = new MediaStreamTrackProcessor<VideoFrame>({ track })
+      this.send({ type: 'source', key, readable }, [readable])
+      return
+    }
+    // Fallback: play the track in an invisible (but rendered) <video>.
+    this.send({ type: 'source', key, readable: null })
+    const v = document.createElement('video')
+    v.muted = true
+    v.playsInline = true
+    v.autoplay = true
+    v.style.cssText = 'position:fixed;left:0;top:0;width:2px;height:2px;opacity:0.01;pointer-events:none;z-index:-1'
+    v.srcObject = new MediaStream([track])
+    document.body.appendChild(v)
+    void v.play().catch(() => {})
+    this.pullVideos[key] = v
   }
 
   // ---------- camera ----------
@@ -134,14 +213,18 @@ export class Studio {
         height: { ideal: 1080 },
         frameRate: { ideal: this.fps, max: this.fps },
       },
-      audio: audio
+      audio: audio && CAPS.displayAudio
         ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false, suppressLocalAudioPlayback: false }
         : false,
-      systemAudio: audio ? 'include' : 'exclude',
-      selfBrowserSurface: 'exclude',
-      surfaceSwitching: 'include',
-      monitorTypeSurfaces: 'include',
-      preferCurrentTab: false,
+    }
+    if (!isFirefox) {
+      Object.assign(options, {
+        systemAudio: audio ? 'include' : 'exclude',
+        selfBrowserSurface: 'exclude',
+        surfaceSwitching: 'include',
+        monitorTypeSurfaces: 'include',
+        preferCurrentTab: false,
+      } satisfies DisplayMediaStreamOptions)
     }
     // Stay on this page after picking, so you can check the preview first.
     if ('CaptureController' in window) {
@@ -190,14 +273,24 @@ export class Studio {
   }
 
   // ---------- recording ----------
-  start({ target, bitrate, withAudio }: { target: SaveTarget; bitrate: number; withAudio: boolean }) {
+  async start({ target, bitrate, withAudio }: { target: SaveTarget; bitrate: number; withAudio: boolean }) {
     let audioReadable: ReadableStream<AudioData> | null = null
+    let audioPort: MessagePort | null = null
     const transfer: Transferable[] = []
-    if (withAudio) {
-      audioReadable = new MediaStreamTrackProcessor<AudioData>({ track: this.mixer.track.clone() }).readable
-      transfer.push(audioReadable)
+    try {
+      if (withAudio && CAPS.trackProcessor) {
+        audioReadable = new MediaStreamTrackProcessor<AudioData>({ track: this.mixer.track.clone() }).readable
+        transfer.push(audioReadable)
+      } else if (withAudio) {
+        this.tap = await this.mixer.createPcmTap()
+        audioPort = this.tap.port
+        transfer.push(audioPort)
+      }
+    } catch (e) {
+      this.onEvent({ type: 'error', message: `Audio: ${e instanceof Error ? e.message : String(e)}` })
+      return
     }
-    this.send({ type: 'start', target, videoBitrate: bitrate, audioReadable, audioChannels: 2 }, transfer)
+    this.send({ type: 'start', target, videoBitrate: bitrate, audioReadable, audioPort, audioChannels: 2 }, transfer)
   }
   pause() {
     this.send({ type: 'pause' })
@@ -213,6 +306,9 @@ export class Studio {
   }
 
   destroy() {
+    this.sendTrack('screen', null)
+    this.sendTrack('camera', null)
+    this.tap?.stop()
     stopStream(this.cameraStream)
     stopStream(this.micStream)
     stopStream(this.screenStream)
