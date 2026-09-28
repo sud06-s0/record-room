@@ -23,6 +23,48 @@ export const NC_MODES: { id: NcMode; label: string; hint: string }[] = [
 ]
 
 type AiMode = Exclude<NcMode, 'off'>
+
+// Fallback audio path for browsers without MediaStreamTrackProcessor (Firefox):
+// an AudioWorklet collects the final mix and posts planar PCM straight to the
+// recording worker over a MessagePort (so the page's main thread isn't involved).
+const PCM_TAP = 'framecast-pcm-tap'
+const PCM_TAP_SOURCE = `
+class PcmTap extends AudioWorkletProcessor {
+  constructor() {
+    super()
+    this.out = null
+    this.size = 4096
+    this.buf = null
+    this.n = 0
+    this.port.onmessage = (e) => {
+      if (e.data.port) this.out = e.data.port
+      if (e.data.stop) { this.out = null; this.buf = null; this.n = 0 }
+    }
+  }
+  process(inputs) {
+    if (!this.out) return true
+    const input = inputs[0] || []
+    const len = input.length ? input[0].length : 128
+    if (!this.buf) { this.buf = new Float32Array(2 * this.size); this.n = 0 }
+    for (let c = 0; c < 2; c++) {
+      const src = input[Math.min(c, input.length - 1)]
+      if (src) this.buf.set(src, c * this.size + this.n)
+    }
+    this.n += len
+    if (this.n >= this.size) {
+      this.out.postMessage({ data: this.buf, frames: this.size, channels: 2, sampleRate }, [this.buf.buffer])
+      this.buf = null
+    }
+    return true
+  }
+}
+registerProcessor('${PCM_TAP}', PcmTap)
+`
+
+export interface PcmTap {
+  port: MessagePort
+  stop: () => void
+}
 const isAi = (m: NcMode): m is AiMode => m === 'standard' || m === 'strong'
 
 export class AudioMixer {
@@ -36,6 +78,7 @@ export class AudioMixer {
   private sysSource: MediaStreamAudioSourceNode | null = null
   private readonly loaded: Partial<Record<AiMode, ArrayBuffer>> = {}
   private readonly levelBuf: Float32Array<ArrayBuffer>
+  private tapLoaded = false
 
   constructor() {
     this.ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' })
@@ -157,6 +200,47 @@ export class AudioMixer {
     for (const v of this.levelBuf) peak = Math.max(peak, Math.abs(v))
     const db = 20 * Math.log10(peak || 1e-6)
     return Math.max(0, Math.min(1, (db + 60) / 60))
+  }
+
+  /** Fallback audio output for the recorder (see PCM_TAP_SOURCE). */
+  async createPcmTap(): Promise<PcmTap> {
+    if (!this.tapLoaded) {
+      const url = URL.createObjectURL(new Blob([PCM_TAP_SOURCE], { type: 'text/javascript' }))
+      try {
+        await this.ctx.audioWorklet.addModule(url)
+      } finally {
+        URL.revokeObjectURL(url)
+      }
+      this.tapLoaded = true
+    }
+    await this.resume()
+    const node = new AudioWorkletNode(this.ctx, PCM_TAP, {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [2],
+      channelCount: 2,
+      channelCountMode: 'explicit',
+      channelInterpretation: 'speakers',
+    })
+    this.micGain.connect(node)
+    this.sysGain.connect(node)
+    // Keep the node pulled by the audio graph without making any sound.
+    const mute = this.ctx.createGain()
+    mute.gain.value = 0
+    node.connect(mute).connect(this.ctx.destination)
+
+    const channel = new MessageChannel()
+    node.port.postMessage({ port: channel.port2 }, [channel.port2])
+    return {
+      port: channel.port1,
+      stop: () => {
+        node.port.postMessage({ stop: true })
+        try { node.disconnect() } catch {}
+        try { mute.disconnect() } catch {}
+        try { this.micGain.disconnect(node) } catch {}
+        try { this.sysGain.disconnect(node) } catch {}
+      },
+    }
   }
 
   get track(): MediaStreamTrack {
