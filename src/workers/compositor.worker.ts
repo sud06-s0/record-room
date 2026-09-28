@@ -8,10 +8,10 @@ import {
   Output,
   Mp4OutputFormat,
   StreamTarget,
-  CanvasSource,
+  EncodedVideoPacketSource,
+  EncodedPacket,
   AudioSampleSource,
   AudioSample,
-  canEncodeVideo,
   canEncodeAudio,
   type StreamTargetChunk,
 } from 'mediabunny'
@@ -65,7 +65,7 @@ let nextTickAt = 0
 // ---------- recording state ----------
 interface Recording {
   output: Output
-  videoSource: CanvasSource
+  video: VideoPipe
   audioSource: AudioSampleSource | null
   audioCodec: AudioCodecUsed
   videoCodec: VideoCodecUsed
@@ -73,8 +73,8 @@ interface Recording {
   startAt: number
   pausedTotal: number
   pausedAt: number
-  videoBusy: boolean
   lastVideoTs: number
+  lastKeyTs: number
   framesAdded: number
   framesDropped: number
   audioReader: ReadableStreamDefaultReader<AudioData> | null
@@ -193,14 +193,16 @@ function drawBubble(c: OffscreenCanvasRenderingContext2D) {
   const cy = y + d / 2
   const r = d / 2
 
-  // soft shadow
+  // Soft edge without shadowBlur (blur is one of the most expensive canvas
+  // operations): two faint rings stacked around the bubble.
   c.save()
-  c.shadowColor = 'rgba(0,0,0,0.45)'
-  c.shadowBlur = 28
-  c.shadowOffsetY = 6
+  c.fillStyle = 'rgba(0,0,0,0.18)'
   c.beginPath()
-  c.arc(cx, cy, r, 0, Math.PI * 2)
-  c.fillStyle = '#16161d'
+  c.arc(cx, cy + 4, r + 10, 0, Math.PI * 2)
+  c.fill()
+  c.fillStyle = 'rgba(0,0,0,0.22)'
+  c.beginPath()
+  c.arc(cx, cy + 2, r + 4, 0, Math.PI * 2)
   c.fill()
   c.restore()
 
@@ -264,22 +266,7 @@ function tick() {
   draw()
   const r = rec
   if (r && !r.pausedAt && !r.stopping) {
-    if (r.videoBusy) {
-      r.framesDropped++
-    } else {
-      const t = recTime()
-      if (t > r.lastVideoTs) {
-        r.lastVideoTs = t
-        r.videoBusy = true
-        r.videoSource
-          .add(t, 1 / fps)
-          .then(() => {
-            r.framesAdded++
-            r.videoBusy = false
-          })
-          .catch(fail)
-      }
-    }
+    encodeFrame(r)
   }
   scheduleTick()
 }
@@ -367,6 +354,125 @@ function listenAudioPort(r: Recording, port: MessagePort) {
   }
 }
 
+// ---------- video encoding ----------
+// We drive WebCodecs' VideoEncoder ourselves: prefer the GPU encoder, keep a few
+// frames queued, and only skip a frame when that queue is truly full. Encoded
+// packets are handed to the MP4 muxer in order, without blocking new frames.
+
+interface PickedEncoder {
+  codec: VideoCodecUsed
+  config: VideoEncoderConfig
+  hardware: boolean
+}
+
+interface VideoPipe {
+  encoder: VideoEncoder
+  muxChain: Promise<void>
+  /** packets waiting to be written to the file */
+  pendingMux: number
+}
+
+/** Frames allowed to wait in the encoder before we start skipping. */
+const MAX_ENCODE_QUEUE = 8
+/** Packets allowed to wait for the disk before we start skipping. */
+const MAX_PENDING_MUX = 120
+const KEYFRAME_EVERY_S = 2
+
+async function pickVideoEncoder(bitrate: number): Promise<PickedEncoder | null> {
+  // Level 4.0 covers 1080p30, 4.2 covers 1080p60.
+  const level = fps > 30 ? '2a' : '28'
+  const candidates: { codec: VideoCodecUsed; strings: string[] }[] = [
+    { codec: 'avc', strings: [`avc1.6400${level}`, `avc1.4d00${level}`, `avc1.42e0${level}`] },
+    { codec: 'vp9', strings: ['vp09.00.40.08', 'vp09.00.41.08'] },
+  ]
+  for (const { codec, strings } of candidates) {
+    // Graphics card first; the CPU encoder only if there's no hardware one.
+    for (const hardwareAcceleration of ['prefer-hardware', 'no-preference'] as const) {
+      for (const codecString of strings) {
+        const config: VideoEncoderConfig = {
+          codec: codecString,
+          width: W,
+          height: H,
+          bitrate,
+          framerate: fps,
+          bitrateMode: 'variable',
+          latencyMode: 'realtime',
+          hardwareAcceleration,
+          ...(codec === 'avc' ? { avc: { format: 'avc' } } : {}),
+        }
+        try {
+          const support = await VideoEncoder.isConfigSupported(config)
+          if (support.supported) {
+            return { codec, config: support.config ?? config, hardware: hardwareAcceleration === 'prefer-hardware' }
+          }
+        } catch {}
+      }
+    }
+  }
+  return null
+}
+
+function createVideoPipe(picked: PickedEncoder, source: EncodedVideoPacketSource): VideoPipe {
+  const pipe: VideoPipe = {
+    encoder: null as unknown as VideoEncoder,
+    muxChain: Promise.resolve(),
+    pendingMux: 0,
+  }
+  pipe.encoder = new VideoEncoder({
+    output: (chunk, meta) => {
+      const packet = EncodedPacket.fromEncodedChunk(chunk)
+      pipe.pendingMux++
+      pipe.muxChain = pipe.muxChain
+        .then(() => source.add(packet, meta))
+        .then(() => {
+          pipe.pendingMux--
+        })
+        .catch((e) => {
+          if (rec && !rec.stopping) fail(e)
+        })
+    },
+    error: (e) => {
+      if (rec && !rec.stopping) fail(e)
+    },
+  })
+  pipe.encoder.configure(picked.config)
+  return pipe
+}
+
+function encodeFrame(r: Recording) {
+  const c = canvas
+  const enc = r.video.encoder
+  if (!c || enc.state !== 'configured') return
+  const t = recTime()
+  if (t <= r.lastVideoTs) return
+  if (enc.encodeQueueSize >= MAX_ENCODE_QUEUE || r.video.pendingMux >= MAX_PENDING_MUX) {
+    r.framesDropped++
+    return
+  }
+  r.lastVideoTs = t
+  const frame = new VideoFrame(c, { timestamp: Math.round(t * 1e6), duration: Math.round(1e6 / fps) })
+  const keyFrame = t - r.lastKeyTs >= KEYFRAME_EVERY_S
+  if (keyFrame) r.lastKeyTs = t
+  try {
+    enc.encode(frame, { keyFrame })
+    r.framesAdded++
+  } finally {
+    frame.close()
+  }
+}
+
+async function finishVideo(pipe: VideoPipe) {
+  if (pipe.encoder.state === 'configured') await pipe.encoder.flush()
+  await pipe.muxChain
+  closeVideo(pipe)
+}
+
+function closeVideo(pipe: VideoPipe) {
+  if (pipe.encoder.state !== 'closed') {
+    try { pipe.encoder.close() } catch {}
+  }
+}
+
 // ---------- start / stop ----------
 async function openWritable(target: SaveTarget): Promise<FileSystemWritableFileStream> {
   if (target.kind === 'handle') return await target.handle.createWritable()
@@ -380,11 +486,9 @@ async function start(msg: Extract<ToWorker, { type: 'start' }>) {
   if (!canvas) throw new Error('Preview is not ready yet')
   const { target, videoBitrate, audioReadable, audioPort, audioChannels } = msg
 
-  // H.264 first; VP9 (still inside an .mp4) if this browser has no H.264 encoder.
-  let videoCodec: VideoCodecUsed
-  if (await canEncodeVideo('avc', { width: W, height: H, bitrate: videoBitrate })) videoCodec = 'avc'
-  else if (await canEncodeVideo('vp9', { width: W, height: H, bitrate: videoBitrate })) videoCodec = 'vp9'
-  else throw new Error('This browser cannot encode 1080p video. Use the latest Chrome or Edge.')
+  const picked = await pickVideoEncoder(videoBitrate)
+  if (!picked) throw new Error('This browser cannot encode 1080p video. Use the latest Chrome or Edge.')
+  const videoCodec = picked.codec
 
   const fileWritable = await openWritable(target)
   const bytes = { value: 0 }
@@ -406,14 +510,9 @@ async function start(msg: Extract<ToWorker, { type: 'start' }>) {
     target: new StreamTarget(writable, { chunked: true, chunkSize: 8 * 1024 * 1024 }),
   })
 
-  const videoSource = new CanvasSource(canvas, {
-    codec: videoCodec,
-    bitrate: videoBitrate,
-    keyFrameInterval: 2,
-    latencyMode: 'realtime',
-    bitrateMode: 'variable',
-  })
+  const videoSource = new EncodedVideoPacketSource(videoCodec)
   output.addVideoTrack(videoSource, { frameRate: fps })
+  const video = createVideoPipe(picked, videoSource)
 
   let audioSource: AudioSampleSource | null = null
   let audioCodec: AudioCodecUsed = null
@@ -434,7 +533,7 @@ async function start(msg: Extract<ToWorker, { type: 'start' }>) {
 
   const r: Recording = {
     output,
-    videoSource,
+    video,
     audioSource,
     audioCodec,
     videoCodec,
@@ -442,8 +541,8 @@ async function start(msg: Extract<ToWorker, { type: 'start' }>) {
     startAt: performance.now(),
     pausedTotal: 0,
     pausedAt: 0,
-    videoBusy: false,
     lastVideoTs: -1,
+    lastKeyTs: -Infinity,
     framesAdded: 0,
     framesDropped: 0,
     audioReader: null,
@@ -469,13 +568,7 @@ async function start(msg: Extract<ToWorker, { type: 'start' }>) {
     else audioPort.close()
   }
 
-  post({ type: 'started', audioCodec, videoCodec })
-}
-
-async function waitVideoIdle(r: Recording) {
-  for (let i = 0; i < 400 && r.videoBusy; i++) {
-    await new Promise((res) => setTimeout(res, 10))
-  }
+  post({ type: 'started', audioCodec, videoCodec, hardwareEncoder: picked.hardware })
 }
 
 async function stopAudio(r: Recording) {
@@ -494,7 +587,7 @@ async function stop() {
   if (!r) return
   r.stopping = true
   const duration = recTime()
-  await waitVideoIdle(r)
+  await finishVideo(r.video)
   await stopAudio(r)
   await r.output.finalize()
   const result: StopResult = {
@@ -514,7 +607,7 @@ async function discard() {
   const r = rec
   if (!r) return
   r.stopping = true
-  await waitVideoIdle(r)
+  closeVideo(r.video)
   await stopAudio(r)
   try { await r.output.cancel() } catch {}
   rec = null
@@ -527,6 +620,7 @@ function fail(err: unknown) {
   if (r) {
     r.audioReader?.cancel().catch(() => {})
     r.audioPort?.close()
+    closeVideo(r.video)
     r.output.cancel().catch(() => {})
   }
   post({ type: 'error', message: errorMessage(err), target: r?.target })
