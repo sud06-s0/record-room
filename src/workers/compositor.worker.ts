@@ -20,11 +20,13 @@ import type {
   Fit,
   FromWorker,
   Layout,
+  PcmChunk,
   SaveTarget,
   SourceKey,
   StopResult,
   TargetInfo,
   ToWorker,
+  VideoCodecUsed,
 } from '../shared/types'
 
 declare const self: DedicatedWorkerGlobalScope
@@ -35,8 +37,10 @@ const H = 1080
 let canvas: OffscreenCanvas | null = null
 let ctx: OffscreenCanvasRenderingContext2D | null = null
 
+type Frame = VideoFrame | ImageBitmap
+
 // Latest decoded frames from each source.
-const latest: Record<SourceKey, VideoFrame | null> = { screen: null, camera: null }
+const latest: Record<SourceKey, Frame | null> = { screen: null, camera: null }
 const readers: Record<SourceKey, ReadableStreamDefaultReader<VideoFrame> | null> = {
   screen: null,
   camera: null,
@@ -52,6 +56,9 @@ let layout: Layout = {
 }
 
 let fps = 30
+// Fallback (Firefox): no MediaStreamTrackProcessor, so ask the page for frames each tick.
+let pullMode = false
+let pullPending = false
 let tickTimer: ReturnType<typeof setTimeout> | null = null
 let nextTickAt = 0
 
@@ -61,6 +68,8 @@ interface Recording {
   videoSource: CanvasSource
   audioSource: AudioSampleSource | null
   audioCodec: AudioCodecUsed
+  videoCodec: VideoCodecUsed
+  audioPort: MessagePort | null
   startAt: number
   pausedTotal: number
   pausedAt: number
@@ -115,14 +124,24 @@ async function setSource(key: SourceKey, readable: ReadableStream<VideoFrame> | 
 }
 
 // ---------- drawing ----------
-function frameSize(f: VideoFrame) {
+function frameSize(f: Frame) {
+  if (f instanceof ImageBitmap) return { w: f.width, h: f.height }
   return { w: f.displayWidth || f.codedWidth, h: f.displayHeight || f.codedHeight }
+}
+
+function setFrames(frames: Partial<Record<SourceKey, ImageBitmap>>) {
+  for (const key of ['screen', 'camera'] as const) {
+    const bmp = frames[key]
+    if (!bmp) continue
+    latest[key]?.close()
+    latest[key] = bmp
+  }
 }
 
 /** Draws a frame into (x, y, w, h) like CSS object-fit. */
 function drawFit(
   c: OffscreenCanvasRenderingContext2D,
-  frame: VideoFrame,
+  frame: Frame,
   x: number,
   y: number,
   w: number,
@@ -238,6 +257,10 @@ function recTime(): number {
 }
 
 function tick() {
+  if (pullMode && !pullPending) {
+    pullPending = true
+    post({ type: 'need-frames' })
+  }
   draw()
   const r = rec
   if (r && !r.pausedAt && !r.stopping) {
@@ -276,6 +299,34 @@ function startLoop() {
 }
 
 // ---------- audio ----------
+// Timestamps come from counting samples, re-anchored to the video clock at the
+// start and after every resume, so audio and video stay in sync.
+async function writeAudio(r: Recording, buf: Float32Array<ArrayBuffer>, ch: number, frames: number, sr: number) {
+  if (!r.audioSource) return
+  if (r.audioResync) {
+    r.audioOffset = recTime() - r.audioSamplesWritten / sr
+    r.audioResync = false
+  }
+  let ts = Math.max(0, r.lastAudioEnd, r.audioOffset + r.audioSamplesWritten / sr)
+  // Guard against a drifting audio clock: never let audio run more than 0.25 s
+  // ahead of or behind the video clock.
+  const now = recTime()
+  if (ts > now + 0.25) return
+  if (ts < now - 0.25) {
+    r.audioOffset += now - ts
+    ts = now
+  }
+  const sample = new AudioSample({ data: buf, format: 'f32-planar', numberOfChannels: ch, sampleRate: sr, timestamp: ts })
+  r.audioSamplesWritten += frames
+  r.lastAudioEnd = ts + frames / sr
+  try {
+    await r.audioSource.add(sample)
+  } finally {
+    sample.close()
+  }
+}
+
+/** Chrome / Edge: AudioData from MediaStreamTrackProcessor. */
 async function pumpAudio(reader: ReadableStreamDefaultReader<AudioData>) {
   try {
     while (true) {
@@ -295,32 +346,24 @@ async function pumpAudio(reader: ReadableStreamDefaultReader<AudioData>) {
         data.copyTo(buf.subarray(c * frames, (c + 1) * frames), { planeIndex: c, format: 'f32-planar' })
       }
       data.close()
-
-      // Timestamps come from counting samples, re-anchored to the video clock
-      // at the start and after every resume, so audio and video stay in sync.
-      if (r.audioResync) {
-        r.audioOffset = recTime() - r.audioSamplesWritten / sr
-        r.audioResync = false
-      }
-      const ts = Math.max(0, r.lastAudioEnd, r.audioOffset + r.audioSamplesWritten / sr)
-      const sample = new AudioSample({
-        data: buf,
-        format: 'f32-planar',
-        numberOfChannels: ch,
-        sampleRate: sr,
-        timestamp: ts,
-      })
-      r.audioSamplesWritten += frames
-      r.lastAudioEnd = ts + frames / sr
-      try {
-        r.audioPending = r.audioSource.add(sample)
-        await r.audioPending
-      } finally {
-        sample.close()
-      }
+      r.audioPending = writeAudio(r, buf, ch, frames, sr)
+      await r.audioPending
     }
   } catch (e) {
     if (rec && rec.audioReader === reader && !rec.stopping) fail(e)
+  }
+}
+
+/** Fallback (Firefox): planar PCM chunks posted by an AudioWorklet. */
+function listenAudioPort(r: Recording, port: MessagePort) {
+  port.onmessage = (e: MessageEvent<PcmChunk>) => {
+    if (rec !== r || r.pausedAt || r.stopping || !r.audioSource) return
+    const { data, channels, frames, sampleRate } = e.data
+    r.audioPending = (r.audioPending ?? Promise.resolve())
+      .then(() => writeAudio(r, data, channels, frames, sampleRate))
+      .catch((err) => {
+        if (rec === r && !r.stopping) fail(err)
+      })
   }
 }
 
@@ -335,10 +378,13 @@ async function openWritable(target: SaveTarget): Promise<FileSystemWritableFileS
 async function start(msg: Extract<ToWorker, { type: 'start' }>) {
   if (rec) throw new Error('Already recording')
   if (!canvas) throw new Error('Preview is not ready yet')
-  const { target, videoBitrate, audioReadable, audioChannels } = msg
+  const { target, videoBitrate, audioReadable, audioPort, audioChannels } = msg
 
-  const videoOk = await canEncodeVideo('avc', { width: W, height: H, bitrate: videoBitrate })
-  if (!videoOk) throw new Error('This browser cannot encode H.264 video. Use the latest Chrome or Edge.')
+  // H.264 first; VP9 (still inside an .mp4) if this browser has no H.264 encoder.
+  let videoCodec: VideoCodecUsed
+  if (await canEncodeVideo('avc', { width: W, height: H, bitrate: videoBitrate })) videoCodec = 'avc'
+  else if (await canEncodeVideo('vp9', { width: W, height: H, bitrate: videoBitrate })) videoCodec = 'vp9'
+  else throw new Error('This browser cannot encode 1080p video. Use the latest Chrome or Edge.')
 
   const fileWritable = await openWritable(target)
   const bytes = { value: 0 }
@@ -361,7 +407,7 @@ async function start(msg: Extract<ToWorker, { type: 'start' }>) {
   })
 
   const videoSource = new CanvasSource(canvas, {
-    codec: 'avc',
+    codec: videoCodec,
     bitrate: videoBitrate,
     keyFrameInterval: 2,
     latencyMode: 'realtime',
@@ -371,7 +417,7 @@ async function start(msg: Extract<ToWorker, { type: 'start' }>) {
 
   let audioSource: AudioSampleSource | null = null
   let audioCodec: AudioCodecUsed = null
-  if (audioReadable) {
+  if (audioReadable || audioPort) {
     const numberOfChannels = audioChannels || 2
     if (await canEncodeAudio('aac', { numberOfChannels, sampleRate: 48000, bitrate: 192000 })) {
       audioCodec = 'aac'
@@ -391,6 +437,8 @@ async function start(msg: Extract<ToWorker, { type: 'start' }>) {
     videoSource,
     audioSource,
     audioCodec,
+    videoCodec,
+    audioPort,
     startAt: performance.now(),
     pausedTotal: 0,
     pausedAt: 0,
@@ -416,8 +464,12 @@ async function start(msg: Extract<ToWorker, { type: 'start' }>) {
     if (audioSource) void pumpAudio(reader)
     else reader.cancel().catch(() => {})
   }
+  if (audioPort) {
+    if (audioSource) listenAudioPort(r, audioPort)
+    else audioPort.close()
+  }
 
-  post({ type: 'started', audioCodec })
+  post({ type: 'started', audioCodec, videoCodec })
 }
 
 async function waitVideoIdle(r: Recording) {
@@ -427,6 +479,10 @@ async function waitVideoIdle(r: Recording) {
 }
 
 async function stopAudio(r: Recording) {
+  if (r.audioPort) {
+    r.audioPort.onmessage = null
+    r.audioPort.close()
+  }
   if (r.audioReader) {
     try { await r.audioReader.cancel() } catch {}
   }
@@ -447,6 +503,7 @@ async function stop() {
     framesAdded: r.framesAdded,
     framesDropped: r.framesDropped,
     audioCodec: r.audioCodec,
+    videoCodec: r.videoCodec,
     target: r.target,
   }
   rec = null
@@ -469,6 +526,7 @@ function fail(err: unknown) {
   rec = null
   if (r) {
     r.audioReader?.cancel().catch(() => {})
+    r.audioPort?.close()
     r.output.cancel().catch(() => {})
   }
   post({ type: 'error', message: errorMessage(err), target: r?.target })
@@ -497,6 +555,14 @@ self.onmessage = async (e: MessageEvent<ToWorker>) => {
       }
       case 'source':
         await setSource(msg.key, msg.readable)
+        break
+      case 'pull-mode':
+        pullMode = msg.on
+        pullPending = false
+        break
+      case 'frames':
+        pullPending = false
+        setFrames(msg.frames)
         break
       case 'layout':
         layout = { ...layout, ...msg.layout }
