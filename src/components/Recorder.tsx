@@ -1,6 +1,6 @@
 // src/components/Recorder.tsx
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Studio, QUALITY, type QualityKey, type ScreenInfo, type Surface } from '../lib/studio'
+import { Studio, QUALITY, CAPS, type QualityKey, type ScreenInfo, type Surface } from '../lib/studio'
 import { useSettings } from '../lib/settings'
 import { NC_MODES } from '../lib/audio'
 import {
@@ -50,6 +50,7 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
   const [camPreview, setCamPreview] = useState<MediaStream | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [limitedDismissed, setLimitedDismissed] = useState(false)
   const [saved, setSaved] = useState<SavedInfo | null>(null)
   const [playing, setPlaying] = useState<{ name: string; url: string } | null>(null)
   const [monitor, setMonitor] = useState(false)
@@ -94,7 +95,12 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
     switch (ev.type) {
       case 'started':
         setStatus('recording')
-        if (ev.audioCodec === 'opus') setNotice('AAC audio encoder not available — audio saved as Opus inside the MP4.')
+        {
+          const notes: string[] = []
+          if (ev.videoCodec === 'vp9') notes.push('No H.264 encoder in this browser — video saved as VP9 inside the MP4.')
+          if (ev.audioCodec === 'opus') notes.push('No AAC encoder in this browser — audio saved as Opus inside the MP4.')
+          if (notes.length) setNotice(notes.join(' '))
+        }
         break
       case 'stats':
         setStats({ time: ev.time, bytes: ev.bytes, dropped: ev.dropped })
@@ -252,7 +258,10 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
   async function chooseScreen() {
     setError(null)
     try {
-      const info = await studioRef.current!.chooseScreen({ surface: s.surface, audio: s.shareAudio })
+      const info = await studioRef.current!.chooseScreen({
+        surface: CAPS.tabCapture ? s.surface : 'monitor',
+        audio: CAPS.displayAudio && s.shareAudio,
+      })
       setScreenInfo(info)
     } catch (e) {
       const name = errorName(e)
@@ -332,7 +341,7 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
     }
     setStatus('starting')
     const hasAudio = s.micId !== 'none' || !!screenInfo?.hasAudio
-    studioRef.current?.start({ target, bitrate: quality.bitrate, withAudio: hasAudio })
+    void studioRef.current?.start({ target, bitrate: quality.bitrate, withAudio: hasAudio })
   }
 
   const pause = () => studioRef.current?.pause()
@@ -375,6 +384,16 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
           <div className="flex items-start justify-between gap-4 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
             <span>{error}</span>
             <button onClick={() => setError(null)} className="text-rose-300 hover:text-white">✕</button>
+          </div>
+        )}
+        {!CAPS.full && !limitedDismissed && (
+          <div className="flex items-start justify-between gap-4 rounded-xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-200">
+            <span>
+              <b className="font-semibold">Limited mode in this browser.</b> You can record a window or your entire screen
+              with your mic (noise cancellation works). Tab recording, PC sound, saving to a folder and floating controls
+              need Chrome or Edge. Keep this tab visible if recording stutters.
+            </span>
+            <button onClick={() => setLimitedDismissed(true)}>✕</button>
           </div>
         )}
         {notice && (
@@ -501,18 +520,20 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
       <aside className="w-[360px] shrink-0 overflow-y-auto border-l border-white/5 bg-zinc-950/60">
         {needsScreen && (
           <Section title="Screen">
-            <div>
-              <Label>What to share</Label>
-              <Segmented
-                value={s.surface}
-                onChange={(surface) => set({ surface: surface as Surface })}
-                options={[
-                  { value: 'browser', label: 'Tab' },
-                  { value: 'window', label: 'Window' },
-                  { value: 'monitor', label: 'Entire screen' },
-                ]}
-              />
-            </div>
+            {CAPS.tabCapture && (
+              <div>
+                <Label>What to share</Label>
+                <Segmented
+                  value={s.surface}
+                  onChange={(surface) => set({ surface: surface as Surface })}
+                  options={[
+                    { value: 'browser', label: 'Tab' },
+                    { value: 'window', label: 'Window' },
+                    { value: 'monitor', label: 'Entire screen' },
+                  ]}
+                />
+              </div>
+            )}
             {screenInfo ? (
               <div className="rounded-lg border border-white/10 bg-zinc-900 p-3">
                 <div className="text-xs text-zinc-500">{SURFACE_LABEL[screenInfo.surface] || 'Sharing'}</div>
@@ -538,15 +559,17 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
                 onClick={chooseScreen}
                 className="w-full rounded-lg border border-dashed border-white/15 bg-zinc-900/60 py-3 text-sm font-medium text-zinc-200 hover:border-rose-500/50 hover:text-white"
               >
-                Choose {SURFACE_LABEL[s.surface].toLowerCase()} to share…
+                {CAPS.tabCapture ? `Choose ${SURFACE_LABEL[s.surface].toLowerCase()} to share…` : 'Choose a window or screen to share…'}
               </button>
             )}
-            <Toggle
-              checked={s.shareAudio}
-              onChange={(shareAudio) => set({ shareAudio })}
-              label="Include PC / tab sound"
-              hint="Tab sound works for tabs. Full PC sound needs “Entire screen” on Windows. Applies next time you choose."
-            />
+            {CAPS.displayAudio && (
+              <Toggle
+                checked={s.shareAudio}
+                onChange={(shareAudio) => set({ shareAudio })}
+                label="Include PC / tab sound"
+                hint="Tab sound works for tabs. Full PC sound needs “Entire screen” on Windows. Applies next time you choose."
+              />
+            )}
           </Section>
         )}
 
@@ -635,7 +658,7 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
             <Label right={<span>{Math.round(s.micVolume * 100)}%</span>}>Mic volume</Label>
             <Slider value={s.micVolume} max={2} onChange={(micVolume) => set({ micVolume })} />
           </div>
-          {needsScreen && (
+          {needsScreen && CAPS.displayAudio && (
             <div>
               <Label right={<span>{Math.round(s.systemVolume * 100)}%</span>}>PC / tab sound volume</Label>
               <Slider value={s.systemVolume} max={1.5} onChange={(systemVolume) => set({ systemVolume })} />
@@ -675,7 +698,11 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
               </button>
             ) : null}
             {!(folder.handle && folder.permission === 'granted') && (
-              <p className="mt-1.5 text-xs text-zinc-500">Until you pick one, recordings download to your Downloads folder.</p>
+              <p className="mt-1.5 text-xs text-zinc-500">
+                {canPickFolder()
+                  ? 'Until you pick one, recordings download to your Downloads folder.'
+                  : 'Recordings download to your Downloads folder when you stop.'}
+              </p>
             )}
           </div>
           <Toggle checked={s.countdown} onChange={(countdown) => set({ countdown })} label="3-second countdown" />
