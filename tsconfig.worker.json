@@ -1,0 +1,10 @@
+// tsconfig.worker.json
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "WebWorker", "WebWorker.AsyncIterable"],
+    "types": ["vite/client"]
+  },
+  "include": ["src/workers", "src/shared", "src/env.d.ts"],
+  "exclude": []
+}
