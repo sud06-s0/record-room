@@ -55,6 +55,9 @@ export class Studio {
   private readonly worker: Worker
   private cameraStream: MediaStream | null = null
   private micStream: MediaStream | null = null
+  /** false when the stream comes from the phone link (not ours to stop) */
+  private cameraOwned = true
+  private micOwned = true
   private screenStream: MediaStream | null = null
   private fps = 30
   /** Tracks currently feeding the worker, so they can be stopped when replaced. */
@@ -149,8 +152,7 @@ export class Studio {
   // ---------- camera ----------
   /** deviceId: specific camera, undefined = default, 'none' = no camera */
   async setCamera(deviceId?: string): Promise<MediaTrackSettings | null> {
-    stopStream(this.cameraStream)
-    this.cameraStream = null
+    this.releaseCamera()
     if (deviceId === 'none') {
       this.sendTrack('camera', null)
       return null
@@ -165,10 +167,50 @@ export class Studio {
       audio: false,
     })
     this.cameraStream = stream
+    this.cameraOwned = true
     const track = stream.getVideoTracks()[0]
     track.contentHint = 'motion'
     this.sendTrack('camera', track.clone())
     return track.getSettings()
+  }
+
+  private releaseCamera() {
+    if (this.cameraOwned) stopStream(this.cameraStream)
+    this.cameraStream = null
+    this.cameraOwned = true
+  }
+
+  private releaseMic() {
+    if (this.micOwned) stopStream(this.micStream)
+    this.micStream = null
+    this.micOwned = true
+  }
+
+  /** Use a camera that lives elsewhere (the phone link). null = no camera. */
+  setCameraStream(stream: MediaStream | null) {
+    this.releaseCamera()
+    const track = stream?.getVideoTracks()[0]
+    if (!stream || !track) {
+      this.sendTrack('camera', null)
+      return
+    }
+    this.cameraStream = stream
+    this.cameraOwned = false
+    this.sendTrack('camera', track.clone())
+  }
+
+  /** Use a mic that lives elsewhere (the phone link), with the same noise removal. */
+  async setMicStream(stream: MediaStream | null, ncMode: NcMode) {
+    this.releaseMic()
+    const tracks = stream?.getAudioTracks() ?? []
+    if (!tracks.length) {
+      await this.mixer.setMic(null)
+      return
+    }
+    this.micStream = new MediaStream(tracks)
+    this.micOwned = false
+    await this.mixer.resume()
+    await this.mixer.setMic(this.micStream, ncMode)
   }
 
   /** A separate stream for on-screen previews (floating controls). */
@@ -178,8 +220,7 @@ export class Studio {
 
   // ---------- microphone ----------
   async setMic(deviceId: string | undefined, ncMode: NcMode) {
-    stopStream(this.micStream)
-    this.micStream = null
+    this.releaseMic()
     if (deviceId === 'none') {
       await this.mixer.setMic(null)
       return
@@ -199,6 +240,7 @@ export class Studio {
       video: false,
     })
     this.micStream = stream
+    this.micOwned = true
     await this.mixer.resume()
     await this.mixer.setMic(stream, ncMode)
   }
@@ -309,8 +351,8 @@ export class Studio {
     this.sendTrack('screen', null)
     this.sendTrack('camera', null)
     this.tap?.stop()
-    stopStream(this.cameraStream)
-    stopStream(this.micStream)
+    this.releaseCamera()
+    this.releaseMic()
     stopStream(this.screenStream)
     this.worker.terminate()
     void this.mixer.ctx.close()
