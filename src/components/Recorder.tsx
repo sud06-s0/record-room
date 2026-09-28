@@ -61,6 +61,7 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
   const [screenInfo, setScreenInfo] = useState<ScreenInfo | null>(null)
   const [status, setStatus] = useState<RecStatus>('idle')
   const [stats, setStats] = useState({ time: 0, bytes: 0, dropped: 0 })
+  const [gpuEncoder, setGpuEncoder] = useState<boolean | null>(null)
   const [countdownN, setCountdownN] = useState(3)
   const [pipWin, setPipWin] = useState<Window | null>(null)
   const [camPreview, setCamPreview] = useState<MediaStream | null>(null)
@@ -118,6 +119,7 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
   handleEvent.current = (ev: StudioEvent) => {
     switch (ev.type) {
       case 'started':
+        setGpuEncoder(ev.hardwareEncoder)
         setStatus('recording')
         {
           const notes: string[] = []
@@ -589,7 +591,20 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
               <div className="flex flex-1 items-center gap-6 text-sm text-zinc-400">
                 <span className="font-mono text-2xl tabular-nums text-white">{formatTime(stats.time)}</span>
                 <span>{formatBytes(stats.bytes)} written</span>
-                {stats.dropped > 30 && <span className="text-amber-400">PC is struggling — {stats.dropped} frames skipped</span>}
+                {gpuEncoder !== null && (
+                  <span
+                    className={`rounded-full px-2 py-0.5 text-xs ${gpuEncoder ? 'bg-emerald-500/15 text-emerald-300' : 'bg-amber-500/15 text-amber-300'}`}
+                    title={gpuEncoder ? 'Encoding on the graphics card' : 'No hardware encoder found — encoding on the CPU (check chrome://gpu → Video Encode)'}
+                  >
+                    {gpuEncoder ? 'GPU encoder' : 'CPU encoder'}
+                  </span>
+                )}
+                {stats.dropped > 30 && (
+                  <span className="text-amber-400">
+                    PC is struggling — {stats.dropped} frames skipped
+                    {gpuEncoder === false ? ' (CPU encoding — try 30 fps or share a smaller window)' : ''}
+                  </span>
+                )}
               </div>
               {status === 'stopping' || status === 'starting' ? (
                 <span className="text-sm text-zinc-400">{status === 'starting' ? 'Starting…' : 'Saving…'}</span>
