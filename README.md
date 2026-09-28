@@ -31,6 +31,19 @@ Written in TypeScript. `npm run typecheck` checks types; `npm run build` type-ch
    - Output: `dist`
 3. Deploy. No environment variables are needed.
 
+## Phone as camera & mic
+Scan a QR code on the PC and your phone becomes the camera and mic. The video goes phone → PC directly over your WiFi (WebRTC, 1080p, up to 25 Mbps H.264, 128 kbps audio). It never goes through a server.
+
+The one-time pairing handshake uses **Supabase Realtime**. No tables and no storage are used.
+1. Create a free project at supabase.com.
+2. Open **Project Settings → API** and copy the **Project URL** and the **anon / publishable key**.
+3. Open **Realtime → Settings** and make sure public channel access is allowed.
+4. Add both keys to Vercel as `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`, then redeploy. For local dev, put them in `.env.local` (see `.env.example`).
+
+Tips:
+- Keep both devices on the same WiFi. Guest WiFi and VPNs usually block the direct link.
+- Hold the phone sideways and keep it plugged in.
+
 ## Notes
 - **Audio codec:** on Windows and macOS, Chrome and Edge encode AAC audio. On Linux, Chrome has no AAC encoder, so the app automatically uses Opus inside the MP4.
 - **Avoiding echo:** use headphones when recording PC sound. Otherwise the speakers leak into the mic.
