@@ -62,7 +62,7 @@ export interface StopResult {
 }
 
 export type FromWorker =
-  | { type: 'started'; audioCodec: AudioCodecUsed; videoCodec: VideoCodecUsed }
+  | { type: 'started'; audioCodec: AudioCodecUsed; videoCodec: VideoCodecUsed; hardwareEncoder: boolean }
   | { type: 'need-frames' }
   | { type: 'stats'; time: number; bytes: number; paused: boolean; dropped: number }
   | { type: 'paused' }
