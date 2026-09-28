@@ -1,0 +1,18 @@
+/* src/index.css */
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+body {
+  margin: 0;
+  background: #09090b;
+  color: #f4f4f5;
+  -webkit-font-smoothing: antialiased;
+}
+
+select option {
+  background: #18181b;
+}
