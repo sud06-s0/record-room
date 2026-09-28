@@ -19,9 +19,25 @@ import LayoutPicker from './LayoutPicker'
 import FloatingControls, { openPipWindow, pipSupported, type RecStatus } from './FloatingControls'
 import { Section, Select, Segmented, Toggle, Slider, Label } from './ui'
 import VideoModal from './VideoModal'
+import PhonePanel from './PhonePanel'
+import { PhoneReceiver, type LinkState, type LinkStats } from '../lib/phoneLink'
+import { newRoomId } from '../lib/signaling'
 import type { SaveTarget, StopResult, StudioEvent } from '../shared/types'
 
 const SURFACE_LABEL: Record<string, string> = { browser: 'Browser tab', window: 'Window', monitor: 'Entire screen' }
+const ROOM_KEY = 'framecast:phoneRoom'
+function phoneRoom(): string {
+  try {
+    const saved = localStorage.getItem(ROOM_KEY)
+    if (saved) return saved
+    const room = newRoomId()
+    localStorage.setItem(ROOM_KEY, room)
+    return room
+  } catch {
+    return newRoomId()
+  }
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 interface SavedInfo extends StopResult {
@@ -57,6 +73,14 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
   const [level, setLevel] = useState(0)
   const [title, setTitle] = useState('')
   const [camBusy, setCamBusy] = useState(false)
+  // Phone as camera + mic
+  const receiverRef = useRef<PhoneReceiver | null>(null)
+  const [phoneRoomId, setPhoneRoomId] = useState(phoneRoom)
+  const [phoneState, setPhoneState] = useState<LinkState>('idle')
+  const [phoneStream, setPhoneStream] = useState<MediaStream | null>(null)
+  const [phoneStats, setPhoneStats] = useState<LinkStats | null>(null)
+  const [phonePanel, setPhonePanel] = useState(false)
+  const phoneAutoPicked = useRef(false)
   const targetRef = useRef<SaveTarget | null>(null)
   const cancelCountdown = useRef(false)
   const statusRef = useRef(status)
@@ -162,12 +186,21 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
     studioRef.current = studio
     studio.setFps(quality.fps)
     ;(async () => {
-      try {
-        const tmp = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-        tmp.getTracks().forEach((t) => t.stop())
-      } catch {
-        setError('Camera / microphone permission was blocked. Allow it in the address bar, then reload.')
+      // Unlock device names. A PC without a webcam is fine (the phone can be the camera).
+      let blocked = false
+      for (const c of [{ video: true, audio: true }, { audio: true }, { video: true }]) {
+        try {
+          const tmp = await navigator.mediaDevices.getUserMedia(c)
+          tmp.getTracks().forEach((t) => t.stop())
+          blocked = false
+          break
+        } catch (e) {
+          if (errorName(e) === 'NotAllowedError') blocked = true
+        }
       }
+      if (blocked) setError('Camera / microphone permission was blocked. Allow it in the address bar, then reload.')
+      // Resume listening for the phone if it was the camera last time.
+      if (s.cameraId === 'phone' || s.micId === 'phone') void startPhoneLink(false)
       await refreshDevices()
       setReady(true)
     })()
@@ -191,6 +224,10 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
   // Camera
   useEffect(() => {
     if (!ready) return
+    if (s.cameraId === 'phone') {
+      studioRef.current!.setCameraStream(phoneStream)
+      return
+    }
     let cancelled = false
     setCamBusy(true)
     studioRef.current!
@@ -206,17 +243,21 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
       cancelled = true
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, s.cameraId])
+  }, [ready, s.cameraId, s.cameraId === 'phone' ? phoneStream : null])
 
   // Mic + noise cancellation
   useEffect(() => {
     if (!ready) return
+    if (s.micId === 'phone') {
+      studioRef.current!.setMicStream(phoneStream, s.ncMode).catch((e: unknown) => setError(`Phone mic: ${errorMessage(e)}`))
+      return
+    }
     studioRef.current!.setMic(s.micId || undefined, s.ncMode).catch((e: unknown) => {
       if (s.micId && s.micId !== 'none') set({ micId: '' })
       else setError(`Microphone: ${errorMessage(e)}`)
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, s.micId, s.ncMode])
+  }, [ready, s.micId, s.ncMode, s.micId === 'phone' ? phoneStream : null])
 
   useEffect(() => {
     studioRef.current?.mixer.setMicVolume(s.micVolume)
@@ -253,6 +294,60 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
     window.addEventListener('beforeunload', onBeforeUnload)
     return () => window.removeEventListener('beforeunload', onBeforeUnload)
   }, [])
+
+  // ---------- phone link ----------
+  /** Start listening for the phone (keeps running after the panel closes). */
+  async function startPhoneLink(openPanel = true) {
+    if (openPanel) setPhonePanel(true)
+    if (receiverRef.current) return
+    const receiver = new PhoneReceiver(
+      phoneRoomId,
+      setPhoneState,
+      setPhoneStats,
+      (stream) => {
+        setPhoneStream(stream)
+        // First time the phone connects: use it as camera and mic.
+        if (stream && !phoneAutoPicked.current) {
+          phoneAutoPicked.current = true
+          set({ cameraId: 'phone', micId: 'phone' })
+        }
+      },
+      (status) => set({ mirror: status.facing === 'user' }),
+    )
+    receiverRef.current = receiver
+    try {
+      await receiver.start()
+    } catch (e) {
+      receiverRef.current = null
+      setPhoneState('failed')
+      setError(errorMessage(e))
+    }
+  }
+
+  function stopPhoneLink() {
+    phoneAutoPicked.current = false
+    receiverRef.current?.close()
+    receiverRef.current = null
+    setPhoneStream(null)
+    setPhoneState('idle')
+    set({ cameraId: s.cameraId === 'phone' ? '' : s.cameraId, micId: s.micId === 'phone' ? '' : s.micId })
+  }
+
+  function newPhoneLink() {
+    receiverRef.current?.close()
+    receiverRef.current = null
+    setPhoneStream(null)
+    const room = newRoomId()
+    try { localStorage.setItem(ROOM_KEY, room) } catch {}
+    setPhoneRoomId(room)
+    setPhoneState('idle')
+  }
+
+  // Restart listening when the link was regenerated while the panel is open.
+  useEffect(() => {
+    if (phonePanel && !receiverRef.current) void startPhoneLink(false)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phoneRoomId])
 
   // ---------- actions ----------
   async function chooseScreen() {
@@ -363,16 +458,27 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
   }
 
   // ---------- render ----------
+  const phoneLive = !!phoneStream
   const camOptions: { value: string; label: string }[] = [
     ...devices.cams.map((d, i) => ({ value: d.deviceId, label: d.label || `Camera ${i + 1}` })),
+    { value: 'phone', label: phoneLive ? '📱 Phone camera' : '📱 Phone camera (not connected)' },
     { value: 'none', label: 'No camera' },
   ]
   const micOptions = [
     ...devices.mics
       .filter((d) => d.deviceId !== 'communications')
       .map((d, i) => ({ value: d.deviceId, label: d.label || `Microphone ${i + 1}` })),
+    { value: 'phone', label: phoneLive ? '📱 Phone mic' : '📱 Phone mic (not connected)' },
     { value: 'none', label: 'No microphone' },
   ]
+  const pickCamera = (cameraId: string) => {
+    set({ cameraId })
+    if (cameraId === 'phone' && !phoneLive) void startPhoneLink()
+  }
+  const pickMic = (micId: string) => {
+    set({ micId })
+    if (micId === 'phone' && !phoneLive) void startPhoneLink()
+  }
   const recording = status === 'recording' || status === 'paused'
   const nc = NC_MODES.find((m) => m.id === s.ncMode)
 
@@ -576,10 +682,27 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
         <Section title="Camera">
           <Select
             value={s.cameraId || devices.cams[0]?.deviceId || ''}
-            onChange={(cameraId) => set({ cameraId })}
-            options={camOptions.length > 1 ? camOptions : [{ value: '', label: 'No camera found' }, ...camOptions]}
+            onChange={pickCamera}
+            options={devices.cams.length ? camOptions : [{ value: '', label: 'No webcam found' }, ...camOptions]}
             disabled={camBusy}
           />
+          <button
+            onClick={() => void startPhoneLink()}
+            className="flex w-full items-center justify-between rounded-lg border border-white/10 bg-zinc-900 px-3 py-2 text-left text-sm hover:border-rose-500/50"
+          >
+            <span>📱 Use phone as camera &amp; mic</span>
+            <span
+              className={`text-xs ${phoneState === 'connected' ? 'text-emerald-400' : phoneState === 'failed' ? 'text-rose-400' : 'text-zinc-500'}`}
+            >
+              {phoneState === 'connected'
+                ? `Live${phoneStats ? ` · ${phoneStats.mbps.toFixed(1)} Mbps` : ''}`
+                : phoneState === 'idle'
+                  ? 'Pair'
+                  : phoneState === 'failed'
+                    ? 'Failed'
+                    : 'Waiting…'}
+            </span>
+          </button>
           <Toggle checked={s.mirror} onChange={(mirror) => set({ mirror })} label="Mirror camera" />
           {s.mode === 'bubble' && (
             <>
@@ -628,7 +751,7 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
         <Section title="Microphone">
           <Select
             value={s.micId || micOptions[0]?.value || ''}
-            onChange={(micId) => set({ micId })}
+            onChange={pickMic}
             options={micOptions}
           />
           <div className="h-1.5 overflow-hidden rounded-full bg-zinc-800">
@@ -729,6 +852,19 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
         onStop={stop}
         onCancel={() => (cancelCountdown.current = true)}
       />
+      {phonePanel && (
+        <PhonePanel
+          room={phoneRoomId}
+          state={phoneState}
+          stats={phoneStats}
+          onClose={() => setPhonePanel(false)}
+          onDisconnect={() => {
+            stopPhoneLink()
+            setPhonePanel(false)
+          }}
+          onNewLink={newPhoneLink}
+        />
+      )}
       {playing && (
         <VideoModal
           {...playing}
