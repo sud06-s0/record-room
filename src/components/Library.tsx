@@ -8,6 +8,7 @@ import {
   renameRecording,
   formatBytes,
   errorMessage,
+  canPickFolder,
   type FolderState,
   type RecordingItem,
 } from '../lib/folder'
@@ -75,6 +76,16 @@ export default function Library({ folder, onPickFolder, onReconnectFolder, refre
     }
   }
 
+  if (!folder.handle && !canPickFolder()) {
+    return (
+      <Empty
+        title="Recordings go to your Downloads folder"
+        text="This browser can't open a folder on your PC, so each recording downloads when you stop. Use Chrome or Edge to save to a chosen folder and browse recordings here."
+      >
+        {null}
+      </Empty>
+    )
+  }
   if (!folder.handle) {
     return (
       <Empty title="No folder chosen yet" text="Pick the folder where recordings are saved and they'll show up here.">
