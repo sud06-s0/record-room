@@ -33,7 +33,7 @@ export async function openPipWindow(): Promise<Window | null> {
   return win
 }
 
-function CameraBubble({ stream, mirror }: { stream: MediaStream | null; mirror: boolean }) {
+function CameraBubble({ stream, mirror, rotation }: { stream: MediaStream | null; mirror: boolean; rotation: number }) {
   const ref = useRef<HTMLVideoElement>(null)
   useEffect(() => {
     if (ref.current) ref.current.srcObject = stream || null
@@ -48,7 +48,7 @@ function CameraBubble({ stream, mirror }: { stream: MediaStream | null; mirror: 
       muted
       playsInline
       className="h-36 w-36 rounded-full object-cover ring-4 ring-white/90"
-      style={{ transform: mirror ? 'scaleX(-1)' : undefined }}
+      style={{ transform: `${mirror ? 'scaleX(-1) ' : ''}rotate(${rotation}deg)` }}
     />
   )
 }
@@ -62,19 +62,20 @@ interface Props {
   time: number
   cameraStream: MediaStream | null
   mirror: boolean
+  rotation: number
   onPause: () => void
   onResume: () => void
   onStop: () => void
   onCancel: () => void
 }
 
-export default function FloatingControls({ win, status, countdown, time, cameraStream, mirror, onPause, onResume, onStop, onCancel }: Props) {
+export default function FloatingControls({ win, status, countdown, time, cameraStream, mirror, rotation, onPause, onResume, onStop, onCancel }: Props) {
   if (!win) return null
   const paused = status === 'paused'
   return createPortal(
     <div className="flex h-screen flex-col items-center justify-center gap-4 p-4 select-none">
       <div className="relative">
-        <CameraBubble stream={cameraStream} mirror={mirror} />
+        <CameraBubble stream={cameraStream} mirror={mirror} rotation={rotation} />
         {status === 'countdown' && (
           <div className="absolute inset-0 grid place-items-center rounded-full bg-black/60 text-6xl font-bold text-white">
             {countdown}
