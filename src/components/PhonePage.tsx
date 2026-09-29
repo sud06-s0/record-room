@@ -15,6 +15,34 @@ const STATUS: Record<LinkState, { text: string; dot: string }> = {
 }
 
 type WakeLockSentinelLike = { release: () => Promise<void> }
+type LockableOrientation = ScreenOrientation & { lock?: (o: 'landscape') => Promise<void>; unlock?: () => void }
+
+/**
+ * The phone turns the camera picture to match its SCREEN, not the way it's held.
+ * If auto-rotate is off, the screen stays portrait while the phone is sideways and
+ * the PC gets a picture turned 90°. Locking this page to landscape (Android needs
+ * fullscreen for that) makes the phone use its motion sensor instead: the picture
+ * stays upright whichever way the phone is turned sideways.
+ * Must be started from a tap. Returns false where the browser can't lock (iPhone).
+ */
+async function lockLandscape(): Promise<boolean> {
+  try {
+    if (!document.fullscreenElement && document.documentElement.requestFullscreen) {
+      await document.documentElement.requestFullscreen({ navigationUI: 'hide' })
+    }
+    const o = screen.orientation as LockableOrientation
+    if (!o?.lock) return false
+    await o.lock('landscape')
+    return true
+  } catch {
+    return false
+  }
+}
+
+function unlockOrientation() {
+  try { (screen.orientation as LockableOrientation)?.unlock?.() } catch {}
+  if (document.fullscreenElement) void document.exitFullscreen().catch(() => {})
+}
 
 export default function PhonePage({ room }: { room: string }) {
   const senderRef = useRef<PhoneSender | null>(null)
@@ -29,6 +57,7 @@ export default function PhonePage({ room }: { room: string }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [portrait, setPortrait] = useState(() => window.matchMedia('(orientation: portrait)').matches)
+  const [locked, setLocked] = useState(false)
 
   useEffect(() => {
     if (videoRef.current) videoRef.current.srcObject = preview
@@ -59,19 +88,29 @@ export default function PhonePage({ room }: { room: string }) {
     }
   }, [started])
 
-  useEffect(() => () => senderRef.current?.close(), [])
+  useEffect(
+    () => () => {
+      senderRef.current?.close()
+      unlockOrientation()
+    },
+    [],
+  )
 
   async function start() {
     setError(null)
     setBusy(true)
+    // Before anything else is awaited: fullscreen needs the tap that got us here.
+    const lockPromise = lockLandscape()
     const sender = new PhoneSender(room, setState, setStats, setPreview)
     senderRef.current = sender
     try {
+      setLocked(await lockPromise)
       await sender.start('user')
       setStarted(true)
     } catch (e) {
       sender.close()
       senderRef.current = null
+      unlockOrientation()
       setError(
         errorName(e) === 'NotAllowedError'
           ? 'Camera / microphone access was blocked. Allow it in your browser settings for this site, then try again.'
@@ -104,6 +143,8 @@ export default function PhonePage({ room }: { room: string }) {
   }
 
   function stop() {
+    unlockOrientation()
+    setLocked(false)
     senderRef.current?.close()
     senderRef.current = null
     setStarted(false)
@@ -179,7 +220,7 @@ export default function PhonePage({ room }: { room: string }) {
       {portrait && (
         <div className="absolute inset-x-4 top-1/2 -translate-y-1/2 text-center">
           <span className="inline-block rounded-xl bg-black/60 px-4 py-2 text-sm text-zinc-200 backdrop-blur">
-            ↔️ Turn sideways for a full 16:9 picture
+            {locked ? '↔️ Turn the phone sideways' : '↔️ Turn sideways for a full 16:9 picture — and turn on auto-rotate'}
           </span>
         </div>
       )}
