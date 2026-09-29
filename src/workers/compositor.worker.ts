@@ -19,6 +19,7 @@ import type {
   AudioCodecUsed,
   Fit,
   FromWorker,
+  Rotation,
   Layout,
   PcmChunk,
   SaveTarget,
@@ -53,6 +54,7 @@ let layout: Layout = {
   mirror: true,
   splitFit: 'contain',
   hasCamera: true,
+  cameraRotation: 0,
 }
 
 let fps = 30
@@ -138,7 +140,7 @@ function setFrames(frames: Partial<Record<SourceKey, ImageBitmap>>) {
   }
 }
 
-/** Draws a frame into (x, y, w, h) like CSS object-fit. */
+/** Draws a frame into (x, y, w, h) like CSS object-fit, optionally turned and mirrored. */
 function drawFit(
   c: OffscreenCanvasRenderingContext2D,
   frame: Frame,
@@ -148,24 +150,25 @@ function drawFit(
   h: number,
   fit: Fit,
   mirror = false,
+  rotation: Rotation = 0,
 ) {
   const { w: fw, h: fh } = frameSize(frame)
   if (!fw || !fh) return
-  const scale = fit === 'cover' ? Math.max(w / fw, h / fh) : Math.min(w / fw, h / fh)
+  // A quarter turn swaps the picture's width and height.
+  const sideways = rotation === 90 || rotation === 270
+  const sw = sideways ? fh : fw
+  const sh = sideways ? fw : fh
+  const scale = fit === 'cover' ? Math.max(w / sw, h / sh) : Math.min(w / sw, h / sh)
   const dw = fw * scale
   const dh = fh * scale
-  const dx = x + (w - dw) / 2
-  const dy = y + (h - dh) / 2
   c.save()
   c.beginPath()
   c.rect(x, y, w, h)
   c.clip()
-  if (mirror) {
-    c.translate(dx + dw / 2, 0)
-    c.scale(-1, 1)
-    c.translate(-(dx + dw / 2), 0)
-  }
-  c.drawImage(frame, dx, dy, dw, dh)
+  c.translate(x + w / 2, y + h / 2)
+  if (mirror) c.scale(-1, 1)
+  if (rotation) c.rotate((rotation * Math.PI) / 180)
+  c.drawImage(frame, -dw / 2, -dh / 2, dw, dh)
   c.restore()
 }
 
@@ -210,7 +213,7 @@ function drawBubble(c: OffscreenCanvasRenderingContext2D) {
   c.beginPath()
   c.arc(cx, cy, r, 0, Math.PI * 2)
   c.clip()
-  if (latest.camera) drawFit(c, latest.camera, x, y, d, d, 'cover', layout.mirror)
+  if (latest.camera) drawFit(c, latest.camera, x, y, d, d, 'cover', layout.mirror, layout.cameraRotation)
   else placeholder(c, x, y, d, d, 'Camera')
   c.restore()
 
@@ -231,7 +234,7 @@ function draw() {
   c.fillRect(0, 0, W, H)
   switch (layout.mode) {
     case 'camera':
-      if (latest.camera) drawFit(c, latest.camera, 0, 0, W, H, 'cover', layout.mirror)
+      if (latest.camera) drawFit(c, latest.camera, 0, 0, W, H, 'cover', layout.mirror, layout.cameraRotation)
       else placeholder(c, 0, 0, W, H, 'No camera selected')
       break
     case 'bubble':
@@ -241,7 +244,7 @@ function draw() {
       break
     case 'split': {
       const half = W / 2
-      if (latest.camera) drawFit(c, latest.camera, 0, 0, half, H, 'cover', layout.mirror)
+      if (latest.camera) drawFit(c, latest.camera, 0, 0, half, H, 'cover', layout.mirror, layout.cameraRotation)
       else placeholder(c, 0, 0, half, H, 'Camera')
       if (latest.screen) drawFit(c, latest.screen, half, 0, half, H, layout.splitFit)
       else placeholder(c, half, 0, half, H, 'Screen')
