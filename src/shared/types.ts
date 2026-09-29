@@ -5,6 +5,7 @@ export type LayoutMode = 'camera' | 'bubble' | 'split'
 export type BubbleSize = 'small' | 'medium' | 'large'
 export type Corner = 'bl' | 'br' | 'tl' | 'tr'
 export type Fit = 'contain' | 'cover'
+export type Rotation = 0 | 90 | 180 | 270
 export type SourceKey = 'screen' | 'camera'
 export type AudioCodecUsed = 'aac' | 'opus' | null
 export type VideoCodecUsed = 'avc' | 'vp9'
@@ -16,6 +17,8 @@ export interface Layout {
   mirror: boolean
   splitFit: Fit
   hasCamera: boolean
+  /** Extra clockwise turn applied to the camera picture */
+  cameraRotation: Rotation
 }
 
 export type SaveTarget =
