@@ -1,6 +1,6 @@
 // src/lib/settings.ts
 import { useEffect, useState } from 'react'
-import type { BubbleSize, Corner, Fit, LayoutMode } from '../shared/types'
+import type { BubbleSize, Corner, Fit, LayoutMode, Rotation } from '../shared/types'
 import type { NcMode } from './audio'
 import type { QualityKey, Surface } from './studio'
 
@@ -11,6 +11,7 @@ export interface Settings {
   bubbleSize: BubbleSize
   bubbleCorner: Corner
   mirror: boolean
+  cameraRotation: Rotation
   splitFit: Fit
   /** '' = system default, 'none' = off */
   cameraId: string
@@ -30,6 +31,7 @@ export const DEFAULTS: Settings = {
   bubbleSize: 'medium',
   bubbleCorner: 'bl',
   mirror: true,
+  cameraRotation: 0,
   splitFit: 'contain',
   cameraId: '',
   micId: '',
