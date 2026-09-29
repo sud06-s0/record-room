@@ -3,7 +3,7 @@
 // PhoneSender runs on the phone, PhoneReceiver runs on the PC.
 
 import { openSignal, type Signal, type SignalMessage } from './signaling'
-import { boostSdp, HIGH_QUALITY } from './sdp'
+import { boostSdp, HIGH_QUALITY, stripRotationExtension } from './sdp'
 
 export type LinkState = 'idle' | 'waiting' | 'connecting' | 'connected' | 'failed'
 export type Facing = 'user' | 'environment'
@@ -213,7 +213,8 @@ export class PhoneReceiver extends LinkBase {
       this.stream = stream
       this.onStream(stream)
     }
-    await pc.setRemoteDescription({ type: 'offer', sdp })
+    // Without the rotation extension on both sides, the phone sends upright pixels.
+    await pc.setRemoteDescription({ type: 'offer', sdp: stripRotationExtension(sdp) })
     await this.flushIce()
     const answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
