@@ -22,7 +22,7 @@ import VideoModal from './VideoModal'
 import PhonePanel from './PhonePanel'
 import { PhoneReceiver, type LinkState, type LinkStats } from '../lib/phoneLink'
 import { newRoomId } from '../lib/signaling'
-import type { SaveTarget, StopResult, StudioEvent } from '../shared/types'
+import type { Rotation, SaveTarget, StopResult, StudioEvent } from '../shared/types'
 
 const SURFACE_LABEL: Record<string, string> = { browser: 'Browser tab', window: 'Window', monitor: 'Entire screen' }
 const ROOM_KEY = 'framecast:phoneRoom'
@@ -220,8 +220,9 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
       mirror: s.mirror,
       splitFit: s.splitFit,
       hasCamera: s.cameraId !== 'none',
+      cameraRotation: s.cameraRotation,
     })
-  }, [s.mode, s.bubbleSize, s.bubbleCorner, s.mirror, s.splitFit, s.cameraId])
+  }, [s.mode, s.bubbleSize, s.bubbleCorner, s.mirror, s.splitFit, s.cameraId, s.cameraRotation])
 
   // Camera
   useEffect(() => {
@@ -719,6 +720,20 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
             </span>
           </button>
           <Toggle checked={s.mirror} onChange={(mirror) => set({ mirror })} label="Mirror camera" />
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-sm text-zinc-200">
+              Rotate camera
+              <span className="mt-0.5 block text-xs text-zinc-500">If the picture comes out sideways or upside down</span>
+            </span>
+            <button
+              onClick={() => set({ cameraRotation: (((s.cameraRotation ?? 0) + 90) % 360) as Rotation })}
+              className="flex shrink-0 items-center gap-1.5 rounded-lg bg-zinc-800 px-3 py-1.5 text-sm hover:bg-zinc-700"
+              title="Turn the camera picture 90° clockwise"
+            >
+              <span className="text-base leading-none">↻</span>
+              {s.cameraRotation ?? 0}°
+            </button>
+          </div>
           {s.mode === 'bubble' && (
             <>
               <div>
@@ -862,6 +877,7 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
         time={stats.time}
         cameraStream={camPreview}
         mirror={s.mirror}
+        rotation={s.cameraRotation ?? 0}
         onPause={pause}
         onResume={resume}
         onStop={stop}
