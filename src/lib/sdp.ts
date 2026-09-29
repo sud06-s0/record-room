@@ -45,8 +45,24 @@ export const HIGH_QUALITY: QualityHints = {
   audioKbps: 128,
 }
 
+/**
+ * Turn off "rotation notes" (the RTP video-orientation extension).
+ *
+ * With it, a phone held sideways sends the picture unrotated plus a note like
+ * "turn this 180°", and every step on the PC must remember to apply it; if one
+ * step drops the note, the video comes out upside down or sideways. Without it,
+ * the phone rotates the pixels itself before sending, so the PC always gets an
+ * upright picture.
+ */
+export function stripRotationExtension(sdp: string): string {
+  return sdp
+    .split('\r\n')
+    .filter((line) => !/^a=extmap:\d+(\/\w+)? urn:3gpp:video-orientation/.test(line))
+    .join('\r\n')
+}
+
 export function boostSdp(sdp: string, q: QualityHints = HIGH_QUALITY): string {
-  return splitSections(sdp)
+  return splitSections(stripRotationExtension(sdp))
     .map((section) => {
       if (section.startsWith('m=audio')) {
         for (const pt of payloadTypes(section, /^opus$/i)) {
