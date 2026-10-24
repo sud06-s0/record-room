@@ -20,9 +20,11 @@ import FloatingControls, { openPipWindow, pipSupported, type RecStatus } from '.
 import { Section, Select, Segmented, Toggle, Slider, Label } from './ui'
 import VideoModal from './VideoModal'
 import PhonePanel from './PhonePanel'
+import BackgroundPicker from './BackgroundPicker'
+import { loadBackgroundImage, saveBackgroundImage } from '../lib/bgImage'
 import { PhoneReceiver, type LinkState, type LinkStats } from '../lib/phoneLink'
 import { newRoomId } from '../lib/signaling'
-import type { Rotation, SaveTarget, StopResult, StudioEvent } from '../shared/types'
+import type { Background, BgStatus, Rotation, SaveTarget, StopResult, StudioEvent } from '../shared/types'
 
 const SURFACE_LABEL: Record<string, string> = { browser: 'Browser tab', window: 'Window', monitor: 'Entire screen' }
 const ROOM_KEY = 'framecast:phoneRoom'
@@ -74,6 +76,10 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
   const [level, setLevel] = useState(0)
   const [title, setTitle] = useState('')
   const [camBusy, setCamBusy] = useState(false)
+  // Camera background
+  const [bgAiStatus, setBgAiStatus] = useState<BgStatus | null>(null)
+  const [bgKeyerError, setBgKeyerError] = useState<string | null>(null)
+  const [bgThumb, setBgThumb] = useState<string | null>(null)
   // Phone as camera + mic
   const receiverRef = useRef<PhoneReceiver | null>(null)
   const [phoneRoomId, setPhoneRoomId] = useState(phoneRoom)
@@ -89,7 +95,12 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
 
   const busy = status !== 'idle'
   const needsScreen = s.mode !== 'camera'
-  const quality = QUALITY[s.quality] ?? QUALITY['1080p30']
+  const bgActive =
+    s.cameraId !== 'none' && (s.background.mode !== 'none' || (s.mode === 'bubble' && s.background.cutout))
+  const chosenQuality = QUALITY[s.quality] ?? QUALITY['1080p30']
+  // Background effects record at 30 fps, so slower PCs stay smooth.
+  const fpsCapped = bgActive && chosenQuality.fps > 30
+  const quality = fpsCapped ? QUALITY['1080p30'] : chosenQuality
 
   // ---------- helpers ----------
   const closePip = useCallback(() => {
@@ -160,6 +171,10 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
           studioRef.current?.stop()
         }
         break
+      case 'bg-status':
+        if (ev.source === 'ai') setBgAiStatus(ev)
+        else setBgKeyerError(ev.state === 'error' ? (ev.message ?? 'Green screen failed') : null)
+        break
       case 'error':
         setError(ev.message)
         if (statusRef.current !== 'idle') {
@@ -223,6 +238,29 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
       cameraRotation: s.cameraRotation,
     })
   }, [s.mode, s.bubbleSize, s.bubbleCorner, s.mirror, s.splitFit, s.cameraId, s.cameraRotation])
+
+  // Background -> worker
+  useEffect(() => {
+    studioRef.current?.setBackground(s.background)
+  }, [s.background])
+
+  // Your uploaded background picture, from last time
+  useEffect(() => {
+    if (!ready) return
+    let cancelled = false
+    void loadBackgroundImage().then((img) => {
+      if (!img) return
+      if (cancelled) {
+        img.bitmap.close()
+        return
+      }
+      setBgThumb(img.dataUrl)
+      studioRef.current?.setBackgroundImage(img.bitmap)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [ready])
 
   // Camera
   useEffect(() => {
@@ -484,6 +522,17 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
   }
   const recording = status === 'recording' || status === 'paused'
   const nc = NC_MODES.find((m) => m.id === s.ncMode)
+  const setBackground = (patch: Partial<Background>) => set({ background: { ...s.background, ...patch } })
+  async function uploadBackground(file: File) {
+    try {
+      const img = await saveBackgroundImage(file)
+      setBgThumb(img.dataUrl)
+      studioRef.current?.setBackgroundImage(img.bitmap)
+      setBackground({ mode: 'image', image: 'custom' })
+    } catch (e) {
+      setError(`Background picture: ${errorMessage(e)}`)
+    }
+  }
 
   return (
     <div className="flex min-h-0 flex-1">
@@ -778,6 +827,20 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
           )}
         </Section>
 
+        {s.cameraId !== 'none' && (
+          <Section title="Background">
+            <BackgroundPicker
+              value={s.background}
+              onChange={setBackground}
+              layoutMode={s.mode}
+              aiStatus={bgAiStatus}
+              keyerError={bgKeyerError}
+              customThumb={bgThumb}
+              onUpload={(file) => void uploadBackground(file)}
+            />
+          </Section>
+        )}
+
         <Section title="Microphone">
           <Select
             value={s.micId || micOptions[0]?.value || ''}
@@ -828,6 +891,11 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
               onChange={(q) => set({ quality: q as QualityKey })}
               options={Object.entries(QUALITY).map(([k, v]) => ({ value: k, label: v.label }))}
             />
+            {fpsCapped && (
+              <p className="mt-1.5 text-xs text-amber-300/80">
+                Recording at 30 fps while a camera background is on, to keep your PC smooth.
+              </p>
+            )}
           </div>
           <div>
             <Label>Save to</Label>
