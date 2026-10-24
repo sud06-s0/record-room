@@ -3,7 +3,18 @@
 // compositor worker and the audio mixer, and drives recording.
 
 import { AudioMixer, type NcMode, type PcmTap } from './audio'
-import type { FromWorker, Layout, SaveTarget, SourceKey, StudioEvent, ToWorker } from '../shared/types'
+import type { Background, FromWorker, Layout, SaveTarget, SegInit, SourceKey, StudioEvent, ToWorker } from '../shared/types'
+import { DEFAULT_BACKGROUND } from '../shared/backgrounds'
+
+/**
+ * Background AI model (MediaPipe selfie segmenter, landscape, ~250 KB).
+ * Set VITE_SEGMENTER_MODEL_URL to serve your own copy, e.g. '/models/selfie_segmenter_landscape.tflite'.
+ */
+const SEGMENTER_MODEL_URL: string =
+  import.meta.env.VITE_SEGMENTER_MODEL_URL ||
+  'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter_landscape/float16/latest/selfie_segmenter_landscape.tflite'
+/** MediaPipe's WASM runtime, copied out of node_modules by vite.config.ts */
+const MEDIAPIPE_WASM_BASE = `${import.meta.env.BASE_URL}mediapipe`
 
 export type QualityKey = '1080p30' | '1080p60'
 export const QUALITY: Record<QualityKey, { fps: number; bitrate: number; label: string; mbPerMin: number }> = {
@@ -68,6 +79,9 @@ export class Studio {
   /** Current layout, so the camera can be captured at a size that fits it. */
   private layoutMode: Layout['mode'] = 'bubble'
   private tap: PcmTap | null = null
+  private background: Background = { ...DEFAULT_BACKGROUND }
+  /** Started the first time the background AI is needed (it's a ~14 MB download). */
+  private segWorker: Worker | null = null
 
   constructor(
     canvasEl: HTMLCanvasElement,
@@ -315,7 +329,42 @@ export class Studio {
     if (layout.mode && layout.mode !== this.layoutMode) {
       this.layoutMode = layout.mode
       void this.fitCameraToLayout()
+      this.startSegmenterIfNeeded()
     }
+  }
+
+  // ---------- background ----------
+  setBackground(background: Background) {
+    this.background = { ...background }
+    this.send({ type: 'background', background: this.background })
+    this.startSegmenterIfNeeded()
+  }
+
+  /** The uploaded background picture (null = none). */
+  setBackgroundImage(image: ImageBitmap | null) {
+    this.send({ type: 'bg-image', image }, image ? [image] : [])
+  }
+
+  private startSegmenterIfNeeded() {
+    if (this.segWorker) return
+    const bg = this.background
+    const cutout = bg.cutout && this.layoutMode === 'bubble'
+    const needsAi = bg.mode === 'blur' || ((bg.mode !== 'none' || cutout) && bg.keyer === 'ai')
+    if (!needsAi) return
+    const worker = new Worker(new URL('../workers/segmenter.worker.ts', import.meta.url), { type: 'module' })
+    this.segWorker = worker
+    worker.onmessage = (e: MessageEvent<StudioEvent>) => this.onEvent(e.data)
+    worker.onerror = (e) =>
+      this.onEvent({ type: 'bg-status', source: 'ai', state: 'error', message: e.message || 'The background AI could not start.' })
+    const channel = new MessageChannel()
+    const init: SegInit = {
+      type: 'init',
+      wasmBase: new URL(MEDIAPIPE_WASM_BASE, location.href).href,
+      modelUrl: new URL(SEGMENTER_MODEL_URL, location.href).href,
+      port: channel.port2,
+    }
+    worker.postMessage(init, [channel.port2])
+    this.send({ type: 'segmenter', port: channel.port1 }, [channel.port1])
   }
 
   /**
@@ -381,6 +430,7 @@ export class Studio {
     this.releaseMic()
     stopStream(this.screenStream)
     this.worker.terminate()
+    this.segWorker?.terminate()
     void this.mixer.ctx.close()
   }
 }
