@@ -1,6 +1,7 @@
 // src/lib/settings.ts
 import { useEffect, useState } from 'react'
-import type { BubbleSize, Corner, Fit, LayoutMode, Rotation } from '../shared/types'
+import type { Background, BubbleSize, Corner, Fit, LayoutMode, Rotation } from '../shared/types'
+import { DEFAULT_BACKGROUND } from '../shared/backgrounds'
 import type { NcMode } from './audio'
 import type { QualityKey, Surface } from './studio'
 
@@ -24,6 +25,8 @@ export interface Settings {
   quality: QualityKey
   countdown: boolean
   floatingControls: boolean
+  /** Camera background: blur, picture, colour, cutout */
+  background: Background
 }
 
 export const DEFAULTS: Settings = {
@@ -43,11 +46,13 @@ export const DEFAULTS: Settings = {
   quality: '1080p30',
   countdown: true,
   floatingControls: true,
+  background: DEFAULT_BACKGROUND,
 }
 
 function load(): Settings {
   try {
-    return { ...DEFAULTS, ...(JSON.parse(localStorage.getItem(KEY) || '{}') as Partial<Settings>) }
+    const saved = JSON.parse(localStorage.getItem(KEY) || '{}') as Partial<Settings>
+    return { ...DEFAULTS, ...saved, background: { ...DEFAULT_BACKGROUND, ...saved.background } }
   } catch {
     return { ...DEFAULTS }
   }
