@@ -17,6 +17,8 @@ import {
 } from 'mediabunny'
 import type {
   AudioCodecUsed,
+  Background,
+  SegReply,
   Fit,
   FromWorker,
   Rotation,
@@ -29,6 +31,8 @@ import type {
   ToWorker,
   VideoCodecUsed,
 } from '../shared/types'
+import { BG_PRESETS, DEFAULT_BACKGROUND } from '../shared/backgrounds'
+import { ChromaKeyer } from './chromaKey'
 
 declare const self: DedicatedWorkerGlobalScope
 
@@ -39,6 +43,8 @@ let canvas: OffscreenCanvas | null = null
 let ctx: OffscreenCanvasRenderingContext2D | null = null
 
 type Frame = VideoFrame | ImageBitmap
+/** Anything drawFit can place: a camera / screen frame or one of our own canvases. */
+type Drawable = Frame | OffscreenCanvas
 
 // Latest decoded frames from each source.
 const latest: Record<SourceKey, Frame | null> = { screen: null, camera: null }
@@ -126,8 +132,8 @@ async function setSource(key: SourceKey, readable: ReadableStream<VideoFrame> | 
 }
 
 // ---------- drawing ----------
-function frameSize(f: Frame) {
-  if (f instanceof ImageBitmap) return { w: f.width, h: f.height }
+function frameSize(f: Drawable) {
+  if (f instanceof ImageBitmap || f instanceof OffscreenCanvas) return { w: f.width, h: f.height }
   return { w: f.displayWidth || f.codedWidth, h: f.displayHeight || f.codedHeight }
 }
 
@@ -143,7 +149,7 @@ function setFrames(frames: Partial<Record<SourceKey, ImageBitmap>>) {
 /** Draws a frame into (x, y, w, h) like CSS object-fit, optionally turned and mirrored. */
 function drawFit(
   c: OffscreenCanvasRenderingContext2D,
-  frame: Frame,
+  frame: Drawable,
   x: number,
   y: number,
   w: number,
@@ -213,7 +219,7 @@ function drawBubble(c: OffscreenCanvasRenderingContext2D) {
   c.beginPath()
   c.arc(cx, cy, r, 0, Math.PI * 2)
   c.clip()
-  if (latest.camera) drawFit(c, latest.camera, x, y, d, d, 'cover', layout.mirror, layout.cameraRotation)
+  if (latest.camera) drawCamera(c, x, y, d, d)
   else placeholder(c, x, y, d, d, 'Camera')
   c.restore()
 
@@ -227,6 +233,21 @@ function drawBubble(c: OffscreenCanvasRenderingContext2D) {
   c.restore()
 }
 
+/**
+ * "Cutout" bubble: no circle and no background, just you standing over the
+ * screen. Sits on the bottom edge (or near the top for the top corners).
+ * Returns false while there's no cutout yet, so the round bubble is drawn instead.
+ */
+function drawCutout(c: OffscreenCanvasRenderingContext2D): boolean {
+  if (!latest.camera) return false
+  const d = Math.round(H * (BUBBLE_SIZES[layout.bubbleSize] ?? 0.32) * 1.3)
+  const margin = 32
+  const corner = layout.bubbleCorner
+  const x = corner.endsWith('l') ? margin : W - margin - d
+  const y = corner.startsWith('t') ? margin : H - d
+  return drawPerson(c, latest.camera, x, y, d, d)
+}
+
 function draw() {
   const c = ctx
   if (!c) return
@@ -234,23 +255,222 @@ function draw() {
   c.fillRect(0, 0, W, H)
   switch (layout.mode) {
     case 'camera':
-      if (latest.camera) drawFit(c, latest.camera, 0, 0, W, H, 'cover', layout.mirror, layout.cameraRotation)
+      if (latest.camera) drawCamera(c, 0, 0, W, H)
       else placeholder(c, 0, 0, W, H, 'No camera selected')
       break
     case 'bubble':
       if (latest.screen) drawFit(c, latest.screen, 0, 0, W, H, 'contain')
       else placeholder(c, 0, 0, W, H, 'Choose a screen, window or tab to share')
-      if (layout.hasCamera) drawBubble(c)
+      if (layout.hasCamera && !(bg.cutout && drawCutout(c))) drawBubble(c)
       break
     case 'split': {
       const half = W / 2
-      if (latest.camera) drawFit(c, latest.camera, 0, 0, half, H, 'cover', layout.mirror, layout.cameraRotation)
+      if (latest.camera) drawCamera(c, 0, 0, half, H)
       else placeholder(c, 0, 0, half, H, 'Camera')
       if (latest.screen) drawFit(c, latest.screen, half, 0, half, H, layout.splitFit)
       else placeholder(c, half, 0, half, H, 'Screen')
       break
     }
   }
+}
+
+// ---------- camera background ----------
+// Order per camera draw: background (blur / picture / colour), then just you on
+// top. "Just you" comes from either the AI mask (segmenter worker) or the green
+// screen shader. Until either is ready, the plain camera is drawn.
+
+let bg: Background = { ...DEFAULT_BACKGROUND }
+let bgCustom: ImageBitmap | null = null
+const presetCache = new Map<string, OffscreenCanvas>()
+
+// AI mask
+let segPort: MessagePort | null = null
+let segBusy = false
+let segSentAt = 0
+/** Masks per second. Drops automatically if the PC is slow. */
+let segHz = 15
+let segIn: OffscreenCanvas | null = null
+let segInCtx: OffscreenCanvasRenderingContext2D | null = null
+let mask: OffscreenCanvas | null = null
+let maskCtx: OffscreenCanvasRenderingContext2D | null = null
+let maskValid = false
+
+// Green screen
+let keyer: ChromaKeyer | null | undefined // undefined = not tried yet
+let keyerFailed = false
+
+// Scratch canvases
+let person: OffscreenCanvas | null = null
+let personCtx: OffscreenCanvasRenderingContext2D | null = null
+const blurA = new OffscreenCanvas(2, 2)
+const blurACtx = blurA.getContext('2d')!
+const blurB = new OffscreenCanvas(2, 2)
+const blurBCtx = blurB.getContext('2d')!
+// Better downscaling (fewer shimmering pixels in the blur).
+blurACtx.imageSmoothingQuality = 'medium'
+blurBCtx.imageSmoothingQuality = 'medium'
+
+/** Is the camera on screen with an effect that needs "just you"? */
+function cameraEffectOn(): boolean {
+  const camVisible = layout.mode === 'camera' || layout.hasCamera
+  return camVisible && (bg.mode !== 'none' || (layout.mode === 'bubble' && bg.cutout))
+}
+
+/** Green / blue screen is used for picture, colour and cutout. Blur always uses AI. */
+function useKeyer(): boolean {
+  return bg.keyer !== 'ai' && (bg.mode !== 'blur' || (layout.mode === 'bubble' && bg.cutout))
+}
+
+function onSegReply(msg: SegReply) {
+  segBusy = false
+  if (msg.type !== 'mask') return
+  if (!mask || mask.width !== msg.width || mask.height !== msg.height) {
+    mask = new OffscreenCanvas(msg.width, msg.height)
+    maskCtx = mask.getContext('2d')
+  }
+  maskCtx?.putImageData(new ImageData(msg.data, msg.width, msg.height), 0, 0)
+  maskValid = true
+  // Keep the AI under ~45% of each frame's time budget on slow PCs.
+  if (msg.ms > 45) segHz = 6
+  else if (msg.ms > 25) segHz = 10
+  else segHz = 15
+}
+
+/** Send a small copy of the camera frame to the segmenter (if it's time). */
+function requestMask() {
+  const f = latest.camera
+  if (!segPort || !f) return
+  const now = performance.now()
+  if (segBusy && now - segSentAt < 3000) return
+  if (now - segSentAt < 1000 / segHz) return
+  const { w: fw, h: fh } = frameSize(f)
+  if (!fw || !fh) return
+  const mw = fw >= fh ? 256 : Math.round((256 * fw) / fh)
+  const mh = fw >= fh ? Math.round((256 * fh) / fw) : 256
+  if (!segIn || segIn.width !== mw || segIn.height !== mh) {
+    segIn = new OffscreenCanvas(mw, mh)
+    segInCtx = segIn.getContext('2d')
+    if (segInCtx) segInCtx.imageSmoothingQuality = 'medium'
+  }
+  segInCtx!.drawImage(f, 0, 0, mw, mh)
+  const bitmap = segIn.transferToImageBitmap()
+  segBusy = true
+  segSentAt = now
+  segPort.postMessage({ type: 'frame', bitmap }, [bitmap])
+}
+
+/** The mask only fits frames with the same shape (e.g. after switching cameras). */
+function maskFits(f: Frame): boolean {
+  if (!mask || !maskValid) return false
+  const { w, h } = frameSize(f)
+  return Math.abs(w / h - mask.width / mask.height) < 0.03
+}
+
+/** Draws only you (no background) into the rect. false = not available yet. */
+function drawPerson(c: OffscreenCanvasRenderingContext2D, f: Frame, x: number, y: number, w: number, h: number): boolean {
+  if (useKeyer()) {
+    if (keyer === undefined) {
+      keyer = ChromaKeyer.create()
+      if (!keyer && !keyerFailed) {
+        keyerFailed = true
+        post({ type: 'bg-status', source: 'keyer', state: 'error', message: 'Green screen needs WebGL2, which this browser or graphics driver has turned off.' })
+      }
+    }
+    if (!keyer) return false
+    const { w: fw, h: fh } = frameSize(f)
+    if (!fw || !fh) return false
+    const keyed = keyer.process(f, fw, fh, bg.keyer === 'blue' ? 'blue' : 'green')
+    drawFit(c, keyed, x, y, w, h, 'cover', layout.mirror, layout.cameraRotation)
+    return true
+  }
+
+  if (!maskFits(f)) return false
+  if (!person || person.width !== w || person.height !== h) {
+    person = new OffscreenCanvas(w, h)
+    personCtx = person.getContext('2d')
+    if (personCtx) personCtx.imageSmoothingQuality = 'medium'
+  }
+  const p = personCtx!
+  p.globalCompositeOperation = 'source-over'
+  p.clearRect(0, 0, w, h)
+  // The small mask, stretched to size (smoothing gives soft edges for free)...
+  drawFit(p, mask!, 0, 0, w, h, 'cover', layout.mirror, layout.cameraRotation)
+  // ...then the camera, kept only where the mask says "you".
+  p.globalCompositeOperation = 'source-in'
+  drawFit(p, f, 0, 0, w, h, 'cover', layout.mirror, layout.cameraRotation)
+  p.globalCompositeOperation = 'source-over'
+  c.drawImage(person, x, y)
+  return true
+}
+
+function presetCanvas(id: string): OffscreenCanvas {
+  let cv = presetCache.get(id)
+  if (!cv) {
+    const preset = BG_PRESETS.find((p) => p.id === id) ?? BG_PRESETS[0]
+    cv = new OffscreenCanvas(W, H)
+    preset.draw(cv.getContext('2d')!, W, H)
+    presetCache.set(id, cv)
+  }
+  return cv
+}
+
+/**
+ * Cheap blur: shrink the camera picture a lot, then stretch it back up in two
+ * steps. Looks like a soft lens blur and costs a fraction of a real blur filter.
+ */
+function drawBlur(c: OffscreenCanvasRenderingContext2D, f: Frame, x: number, y: number, w: number, h: number) {
+  const [s1, s2] = bg.blur === 'strong' ? [1 / 10, 1 / 36] : [1 / 6, 1 / 18]
+  const aw = Math.max(2, Math.round(w * s1))
+  const ah = Math.max(2, Math.round(h * s1))
+  const bw = Math.max(2, Math.round(w * s2))
+  const bh = Math.max(2, Math.round(h * s2))
+  if (blurA.width !== aw || blurA.height !== ah) {
+    blurA.width = aw
+    blurA.height = ah
+  }
+  if (blurB.width !== bw || blurB.height !== bh) {
+    blurB.width = bw
+    blurB.height = bh
+  }
+  drawFit(blurACtx, f, 0, 0, aw, ah, 'cover', layout.mirror, layout.cameraRotation)
+  blurBCtx.drawImage(blurA, 0, 0, bw, bh)
+  blurACtx.drawImage(blurB, 0, 0, aw, ah)
+  c.save()
+  c.imageSmoothingQuality = 'high'
+  c.drawImage(blurA, x, y, w, h)
+  c.restore()
+}
+
+function drawBackground(c: OffscreenCanvasRenderingContext2D, f: Frame, x: number, y: number, w: number, h: number) {
+  switch (bg.mode) {
+    case 'blur':
+      drawBlur(c, f, x, y, w, h)
+      break
+    case 'color':
+      c.fillStyle = bg.color
+      c.fillRect(x, y, w, h)
+      break
+    case 'image':
+      drawFit(c, bg.image === 'custom' && bgCustom ? bgCustom : presetCanvas(bg.image === 'custom' ? 'studio' : bg.image), x, y, w, h, 'cover')
+      break
+  }
+}
+
+/** The camera in a rect, with the chosen background effect. */
+function drawCamera(c: OffscreenCanvasRenderingContext2D, x: number, y: number, w: number, h: number) {
+  const f = latest.camera
+  if (!f) return
+  if (bg.mode !== 'none') {
+    c.save()
+    c.beginPath()
+    c.rect(x, y, w, h)
+    c.clip()
+    drawBackground(c, f, x, y, w, h)
+    const ok = drawPerson(c, f, x, y, w, h)
+    c.restore()
+    if (ok) return
+  }
+  drawFit(c, f, x, y, w, h, 'cover', layout.mirror, layout.cameraRotation)
 }
 
 // ---------- timing ----------
@@ -266,6 +486,7 @@ function tick() {
     pullPending = true
     post({ type: 'need-frames' })
   }
+  if (cameraEffectOn() && !useKeyer()) requestMask()
   draw()
   const r = rec
   if (r && !r.pausedAt && !r.stopping) {
@@ -663,6 +884,17 @@ self.onmessage = async (e: MessageEvent<ToWorker>) => {
         break
       case 'layout':
         layout = { ...layout, ...msg.layout }
+        break
+      case 'background':
+        bg = { ...msg.background }
+        break
+      case 'bg-image':
+        bgCustom?.close()
+        bgCustom = msg.image
+        break
+      case 'segmenter':
+        segPort = msg.port
+        segPort.onmessage = (ev: MessageEvent<SegReply>) => onSegReply(ev.data)
         break
       case 'fps':
         if (!rec) {
