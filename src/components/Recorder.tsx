@@ -95,8 +95,12 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
 
   const busy = status !== 'idle'
   const needsScreen = s.mode !== 'camera'
+  /** Screen-only layout: the webcam is switched off entirely. */
+  const screenOnly = s.mode === 'screen'
   const bgActive =
-    s.cameraId !== 'none' && (s.background.mode !== 'none' || (s.mode === 'bubble' && s.background.cutout))
+    !screenOnly &&
+    s.cameraId !== 'none' &&
+    (s.background.mode !== 'none' || (s.mode === 'bubble' && s.background.cutout))
   const chosenQuality = QUALITY[s.quality] ?? QUALITY['1080p30']
   // Background effects record at 30 fps, so slower PCs stay smooth.
   const fpsCapped = bgActive && chosenQuality.fps > 30
@@ -265,6 +269,12 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
   // Camera
   useEffect(() => {
     if (!ready) return
+    // Screen only: release the webcam (light off, no wasted CPU). It comes back when you switch layout.
+    if (screenOnly) {
+      if (s.cameraId === 'phone') studioRef.current!.setCameraStream(null)
+      else void studioRef.current!.setCamera('none')
+      return
+    }
     if (s.cameraId === 'phone') {
       studioRef.current!.setCameraStream(phoneStream)
       return
@@ -284,7 +294,7 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
       cancelled = true
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, s.cameraId, s.cameraId === 'phone' ? phoneStream : null])
+  }, [ready, s.cameraId, screenOnly, s.cameraId === 'phone' ? phoneStream : null])
 
   // Mic + noise cancellation
   useEffect(() => {
@@ -744,6 +754,7 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
           </Section>
         )}
 
+        {!screenOnly && (
         <Section title="Camera">
           <Select
             value={s.cameraId || devices.cams[0]?.deviceId || ''}
@@ -826,8 +837,9 @@ export default function Recorder({ folder, onPickFolder, onReconnectFolder, onRe
             </div>
           )}
         </Section>
+        )}
 
-        {s.cameraId !== 'none' && (
+        {!screenOnly && s.cameraId !== 'none' && (
           <Section title="Background">
             <BackgroundPicker
               value={s.background}

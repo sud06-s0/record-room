@@ -4,7 +4,7 @@
 Records 1080p MP4 (H.264 + AAC) straight to a folder on your PC. No server, no database.
 
 ## Features
-- **3 layouts**: Camera only · Screen + round camera bubble · 50/50 split. You can switch layouts live, even mid-recording.
+- **4 layouts**: Camera only · Screen + round camera bubble · 50/50 split · Screen only (no camera). You can switch layouts live, even mid-recording.
 - **Share a tab, a window or the entire screen**, with tab or PC sound.
 - **AI noise cancellation on the mic only**: Standard (RNNoise) or Strong AI (GTCRN). PC and tab sound is mixed in untouched.
 - **Recording keeps full speed in the background.** Compositing and encoding run in a Web Worker.

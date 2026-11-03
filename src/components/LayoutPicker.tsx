@@ -5,6 +5,7 @@ const MODES: { id: LayoutMode; name: string; desc: string }[] = [
   { id: 'camera', name: 'Camera only', desc: 'Full-frame webcam' },
   { id: 'bubble', name: 'Screen + bubble', desc: 'Round camera in the corner' },
   { id: 'split', name: '50 / 50', desc: 'Camera left, screen right' },
+  { id: 'screen', name: 'Screen only', desc: 'No camera, just your screen' },
 ]
 
 function Icon({ id, active }: { id: LayoutMode; active: boolean }) {
@@ -39,13 +40,23 @@ function Icon({ id, active }: { id: LayoutMode; active: boolean }) {
           <rect x="37" y="20" width="16" height="2" rx="1" fill="#52525b" />
         </>
       )}
+      {id === 'screen' && (
+        <>
+          <rect x="4" y="4" width="56" height="28" rx="2" fill={screen} />
+          <rect x="9" y="8" width="24" height="3" rx="1.5" fill="#52525b" />
+          <rect x="9" y="14" width="40" height="2" rx="1" fill="#52525b" />
+          <rect x="9" y="19" width="34" height="2" rx="1" fill="#52525b" />
+          <rect x="9" y="24" width="28" height="2" rx="1" fill="#52525b" />
+          <path d="M44 26l3.5 4 1.5-2.2 3 1.2-2-3.4 2.6-1.1z" fill={active ? '#fb7185' : '#a1a1aa'} />
+        </>
+      )}
     </svg>
   )
 }
 
 export default function LayoutPicker({ value, onChange }: { value: LayoutMode; onChange: (mode: LayoutMode) => void }) {
   return (
-    <div className="grid grid-cols-3 gap-3">
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
       {MODES.map((m) => {
         const active = value === m.id
         return (

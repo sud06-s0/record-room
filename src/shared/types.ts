@@ -1,7 +1,7 @@
 // src/shared/types.ts
 // Types shared by the app and the compositor worker.
 
-export type LayoutMode = 'camera' | 'bubble' | 'split'
+export type LayoutMode = 'camera' | 'bubble' | 'split' | 'screen'
 export type BubbleSize = 'small' | 'medium' | 'large'
 export type Corner = 'bl' | 'br' | 'tl' | 'tr'
 export type Fit = 'contain' | 'cover'
