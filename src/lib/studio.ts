@@ -350,7 +350,7 @@ export class Studio {
     const bg = this.background
     const cutout = bg.cutout && this.layoutMode === 'bubble'
     const needsAi = bg.mode === 'blur' || ((bg.mode !== 'none' || cutout) && bg.keyer === 'ai')
-    if (!needsAi) return
+    if (!needsAi || this.layoutMode === 'screen') return
     const worker = new Worker(new URL('../workers/segmenter.worker.ts', import.meta.url), { type: 'module' })
     this.segWorker = worker
     worker.onmessage = (e: MessageEvent<StudioEvent>) => this.onEvent(e.data)

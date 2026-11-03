@@ -263,6 +263,10 @@ function draw() {
       else placeholder(c, 0, 0, W, H, 'Choose a screen, window or tab to share')
       if (layout.hasCamera && !(bg.cutout && drawCutout(c))) drawBubble(c)
       break
+    case 'screen':
+      if (latest.screen) drawFit(c, latest.screen, 0, 0, W, H, 'contain')
+      else placeholder(c, 0, 0, W, H, 'Choose a screen, window or tab to share')
+      break
     case 'split': {
       const half = W / 2
       if (latest.camera) drawCamera(c, 0, 0, half, H)
@@ -312,7 +316,7 @@ blurBCtx.imageSmoothingQuality = 'medium'
 
 /** Is the camera on screen with an effect that needs "just you"? */
 function cameraEffectOn(): boolean {
-  const camVisible = layout.mode === 'camera' || layout.hasCamera
+  const camVisible = layout.mode === 'camera' || (layout.mode !== 'screen' && layout.hasCamera)
   return camVisible && (bg.mode !== 'none' || (layout.mode === 'bubble' && bg.cutout))
 }
 
